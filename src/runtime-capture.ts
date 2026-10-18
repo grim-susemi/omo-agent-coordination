@@ -61,6 +61,8 @@ const hooks = (global[HOOKS] ??= new WeakMap<Prototype, Hook>()) as WeakMap<Prot
  */
 export function createRuntimeCapture(options: {
   loaderNamespace: SenpiNamespace & { VERSION?: string };
+  /** Exact SDK module published by the pinned native carrier before child construction. */
+  nativeNamespace?: () => SenpiNamespace | undefined;
   generation: number;
   enabled?: boolean;
 }) {
@@ -72,7 +74,8 @@ export function createRuntimeCapture(options: {
   const seen = new WeakSet<object>();
   let disposed = false;
   let refusal: string | undefined;
-  let attached: { prototype: Prototype; hook: Hook } | undefined;
+  const attached = new Map<Prototype, Hook>();
+  const classes = new Set<SenpiNamespace["AgentSession"]>();
   const emit = (capture: CapturedRuntime, event: "bound" | "changed" | "closed") => {
     for (const listener of listeners) listener(capture, event);
   };
@@ -86,7 +89,7 @@ export function createRuntimeCapture(options: {
   };
   const bound = (runtime: LiveSession) => {
     if (disposed || seen.has(runtime)) return;
-    if (!(runtime instanceof options.loaderNamespace.AgentSession) ||
+    if (![...classes].some(AgentSession => runtime instanceof AgentSession) ||
         typeof runtime.sessionId !== "string" || !runtime.sessionManager ||
         typeof runtime.sessionManager.getLeafId !== "function" ||
         typeof runtime.subscribe !== "function" || !runtime.modelRuntime ||
@@ -141,12 +144,13 @@ export function createRuntimeCapture(options: {
     const reason = options.enabled === false || process.env.OMO_AGENT_COORDINATION === "0" ? "mode_disabled" :
       options.loaderNamespace.VERSION !== "2026.10.16" || namespace.VERSION !== "2026.10.16" ? "version" :
       !proto || typeof proto.bindExtensions !== "function" || typeof proto.dispose !== "function" ? "shape" :
-      namespace.AgentSession !== options.loaderNamespace.AgentSession ? "class_identity" : undefined;
+      namespace.AgentSession !== options.loaderNamespace.AgentSession &&
+        namespace.AgentSession !== options.nativeNamespace?.()?.AgentSession ? "class_identity" : undefined;
     if (reason) {
       refusal = reason;
       return { ok: false, reason: "unsupported_runtime", connection: reason };
     }
-    if (attached) return { ok: true, value: undefined };
+    if (attached.has(proto!)) return { ok: true, value: undefined };
     let hook = hooks.get(proto!);
     if (!hook) {
       const original = proto!.bindExtensions;
@@ -168,7 +172,8 @@ export function createRuntimeCapture(options: {
       hooks.set(proto!, hook);
     }
     hook.listeners.set(token, { bound, closed: close });
-    attached = { prototype: proto!, hook };
+    classes.add(namespace.AgentSession);
+    attached.set(proto!, hook);
     return { ok: true, value: undefined };
   };
   const status = moduleReady(options.loaderNamespace);
@@ -206,15 +211,17 @@ export function createRuntimeCapture(options: {
       for (const ref of live) { const runtime = ref.deref(); if (runtime) close(runtime); }
       live.clear();
       listeners.clear();
-      if (!attached) return;
-      const { prototype, hook } = attached;
-      hook.listeners.delete(token);
-      if (hook.listeners.size === 0) {
-        if (prototype.bindExtensions === hook.wrapped) prototype.bindExtensions = hook.original;
-        if (prototype.dispose === hook.wrappedDispose) prototype.dispose = hook.originalDispose;
-        // Keep an inert hook discoverable while another mod's wrapper still chains to it.
-        if (prototype.bindExtensions === hook.original && prototype.dispose === hook.originalDispose) hooks.delete(prototype);
+      for (const [prototype, hook] of attached) {
+        hook.listeners.delete(token);
+        if (hook.listeners.size === 0) {
+          if (prototype.bindExtensions === hook.wrapped) prototype.bindExtensions = hook.original;
+          if (prototype.dispose === hook.wrappedDispose) prototype.dispose = hook.originalDispose;
+          // Keep an inert hook discoverable while another mod's wrapper still chains to it.
+          if (prototype.bindExtensions === hook.original && prototype.dispose === hook.originalDispose) hooks.delete(prototype);
+        }
       }
+      attached.clear();
+      classes.clear();
     },
   });
 }

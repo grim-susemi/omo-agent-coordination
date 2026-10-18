@@ -1,5 +1,59 @@
 import { expect, test } from "bun:test";
 import { runCaptureCase } from "../qa/cases/capture-native.ts";
+import { createRuntimeCapture } from "../src/runtime-capture.ts";
+
+test("capture accepts the exact lazy native SDK class alongside the bundled loader, not a foreign class", async () => {
+  const sessionClass = () => class {
+    sessionId = crypto.randomUUID();
+    sessionManager = { getSessionId: () => this.sessionId, getLeafId: () => null };
+    model = { provider: "capture", id: "offline" };
+    modelRuntime = {};
+    systemPrompt = "";
+    messages: unknown[] = [];
+    activitySnapshot = { isStreaming: false, isBashRunning: false, isCompacting: false,
+      hasSessionWork: false, hasActiveWakeSource: false };
+    async bindExtensions() {}
+    dispose() {}
+    subscribe() { return () => {}; }
+  };
+  const loader = { AgentSession: sessionClass(), VERSION: "2026.10.16" };
+  const native = { AgentSession: sessionClass(), VERSION: "2026.10.16" };
+  const foreign = { AgentSession: sessionClass(), VERSION: "2026.10.16" };
+  let attested: typeof native | undefined;
+  const options = { loaderNamespace: loader, generation: 1, nativeNamespace: () => attested };
+  const originalLoader = loader.AgentSession.prototype.bindExtensions;
+  const originalNative = native.AgentSession.prototype.bindExtensions;
+  const capture = createRuntimeCapture(options);
+  const root = new loader.AgentSession();
+  await root.bindExtensions();
+  expect(capture.forRuntime(root).ok).toBe(true);
+  // R13 publishes the actual lazy import before child construction.
+  attested = native;
+  try {
+    expect(capture.moduleReady(native)).toEqual({ ok: true, value: undefined });
+    const child = new native.AgentSession();
+    await child.bindExtensions();
+    expect(capture.list()).toHaveLength(2);
+    const childCapture = capture.forRuntime(child);
+    expect(childCapture.ok).toBe(true);
+    if (childCapture.ok) expect(childCapture.value.read().ok).toBe(true);
+    child.dispose();
+    expect(capture.forRuntime(child)).toEqual({ ok: false, reason: "capture_missing" });
+  } finally { capture.dispose(); }
+  expect(loader.AgentSession.prototype.bindExtensions).toBe(originalLoader);
+  expect(native.AgentSession.prototype.bindExtensions).toBe(originalNative);
+  const isolated = createRuntimeCapture(options);
+  const foreignBind = foreign.AgentSession.prototype.bindExtensions;
+  try {
+    expect(isolated.moduleReady(foreign)).toEqual({
+      ok: false, reason: "unsupported_runtime", connection: "class_identity",
+    });
+    expect(foreign.AgentSession.prototype.bindExtensions).toBe(foreignBind);
+    const stranger = new foreign.AgentSession();
+    await stranger.bindExtensions();
+    expect(isolated.forRuntime(stranger)).toEqual({ ok: false, reason: "capture_missing" });
+  } finally { isolated.dispose(); }
+});
 
 test("the real loader captures simultaneous parent and native in-process child with live context", async () => {
   const result = await runCaptureCase("capture-in-process");

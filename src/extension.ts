@@ -52,7 +52,12 @@ export default async function coordinationCapture(pi: ExtensionAPI) {
   const previous = global[STATE] as CaptureExtensionState | undefined;
   await previous?.dispose();
   const generation = (previous?.generation ?? 0) + 1;
-  const capture = createRuntimeCapture({ loaderNamespace: namespace, generation });
+  const capture = createRuntimeCapture({ loaderNamespace: namespace, generation,
+    // connectEngineBridge validates the carrier and owning engine before forwarding
+    // readiness. R13 sets module to the exact native SDK import before notifying it.
+    nativeNamespace: () => (global[Symbol.for("omo.agent-coordination.native.v1")] as
+      { module?: SenpiNamespace } | undefined)?.module,
+  });
   const bridges = new WeakMap<object, EngineBridge>();
   const active = new Set<EngineBridge>();
   const inspections = new WeakMap<object, TaskTruth>();
