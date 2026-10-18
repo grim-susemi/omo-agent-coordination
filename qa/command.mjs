@@ -5,12 +5,28 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const product = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-export const attempt = path.join(product, ".omo/evidence/agent-coordination/attempt-20261017-e1");
+export const attempt = path.join(product, ".omo/evidence/agent-coordination/attempt-5135-rebuild-e1");
+export const priorAttempt = path.join(product, ".omo/evidence/agent-coordination/attempt-20261017-e1");
 export const evidence = path.join(attempt, "task-1");
 export const senpi = "C:/Users/USER/.bun/install/global/node_modules/@code-yeongyu/senpi";
 export const omo = "C:/Users/USER/.bun/install/global/node_modules/omo-ai";
-export const bundle = path.join(omo, "plugin/extensions/omo-task.js");
+export const installedBundle = path.join(omo, "plugin/extensions/omo-task.js");
+// QA always builds from preserved baseline bytes, even after the live carrier is installed.
+export const bundle = path.join(attempt, "baseline/omo-task.js");
 export const sha256 = (file) => createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+export function priorPreload(relative) {
+  const source = path.join(priorAttempt, relative);
+  const output = path.join(attempt, relative);
+  // Legacy guards log beside __filename. Read their source, but execute with
+  // the current output filename so neither logs nor sandbox writes touch prior evidence.
+  fs.mkdirSync(path.dirname(output), { recursive: true });
+  if (!fs.existsSync(output)) fs.writeFileSync(output,
+    `const Module = require("node:module");\nconst fixture = new Module(__filename, module);\n` +
+    `fixture.filename = __filename;\nfixture.paths = module.paths;\n` +
+    `fixture._compile(require("node:fs").readFileSync(${JSON.stringify(source)}, "utf8"), __filename);\n`,
+    { flag: "wx" });
+  return output.replaceAll("\\", "/");
+}
 export function sourceHashes() {
   const files = ["package.json", "tsconfig.json", "src/contracts.ts", "test/contracts.test.ts",
     "test/regression.test.ts", "qa/harness.ts", "qa/command.mjs", "qa/probe.mjs",
@@ -39,7 +55,8 @@ export function isolatedEnv(sandbox) {
   env.OMO_TELEMETRY_DISABLED = "1";
   env.DO_NOT_TRACK = "1";
   const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path") ?? "PATH";
-  env[pathKey] = `C:/Users/USER/.bun/bin;C:/Users/USER/.bun/install/global/node_modules/.bin;${env[pathKey] ?? ""}`;
+  const powershell = path.join(process.env.SystemRoot, "System32/WindowsPowerShell/v1.0");
+  env[pathKey] = `C:/Users/USER/.bun/bin;C:/Users/USER/.bun/install/global/node_modules/.bin;${powershell};${env[pathKey] ?? ""}`;
   env.COORDINATION_ATTEMPT_DIR = attempt;
   return env;
 }
@@ -59,7 +76,7 @@ export async function command(argv, { cwd = product, timeoutMs = 120_000, onStdo
     argv, cwd, start_time: new Date().toISOString(), end_time: null, exit_code: null,
     timeout_ms: timeoutMs, source_sha256: sourceHashes(),
     module_sha256: { [bundle]: sha256(bundle), [senpi + "/dist/core/agent-session.js"]: sha256(senpi + "/dist/core/agent-session.js") },
-    raw_output_path: raw, fixture_identity: "attempt-20261017-e1/task-1", status: "running",
+    raw_output_path: raw, fixture_identity: path.relative(product, evidence), status: "running",
   };
   const resolved = argv[0] === "bun" ? ["C:/Users/USER/.bun/bin/bun.exe", ...argv.slice(1)]
     : argv[0] === "bunx" ? ["C:/Users/USER/.bun/bin/bun.exe", "x", ...argv.slice(1)] : argv;

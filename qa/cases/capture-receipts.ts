@@ -3,7 +3,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { attempt, product, senpi, bundle, isolatedEnv, sha256 } from "../command.mjs";
+import { attempt, product, senpi, bundle, isolatedEnv, sha256, priorPreload } from "../command.mjs";
 
 export const captureEvidence = path.join(attempt, "task-2");
 export function captureHashes() {
@@ -26,14 +26,14 @@ export async function captureCommand(argv: string[], timeoutMs = 120_000) {
     end_time: null as string | null, exit_code: null as number | null, timeout_ms: timeoutMs,
     source_sha256: captureHashes(), module_sha256: {
       [bundle]: sha256(bundle), [senpi + "/dist/core/agent-session.js"]: sha256(senpi + "/dist/core/agent-session.js"),
-    }, raw_output_path: raw, fixture_identity: "attempt-20261017-e1/task-2",
+    }, raw_output_path: raw, fixture_identity: path.relative(product, captureEvidence),
     pid: undefined as number | undefined, timed_out: false, error: undefined as string | undefined,
   };
   const save = () => fs.writeFileSync(receiptPath, JSON.stringify(receipt, null, 2) + "\n");
   const fd = fs.openSync(raw, "wx");
   save();
   const env = isolatedEnv(path.join(captureEvidence, "commands", id));
-  const guard = path.join(captureEvidence, "write-guard.cjs").replaceAll("\\", "/");
+  const guard = priorPreload("task-2/write-guard.cjs");
   env.NODE_OPTIONS = `--require="${guard}"`;
   if (argv[0] === "bun" && ["test", "run"].includes(argv[1]!)) {
     // Expand the validated package script so each actual Bun runtime is preloaded.

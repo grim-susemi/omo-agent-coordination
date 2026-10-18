@@ -3,7 +3,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { attempt, product, senpi, bundle, isolatedEnv, sha256 } from "../command.mjs";
+import { attempt, product, senpi, bundle, isolatedEnv, sha256, priorPreload } from "../command.mjs";
 
 export const channelEvidence = path.join(attempt, "task-5");
 export function channelHashes() {
@@ -20,7 +20,7 @@ export async function channelCommand(argv: string[], timeoutMs = 120_000) {
   const id = `${new Date().toISOString().replaceAll(/[:.]/g, "-")}-${randomUUID()}`;
   const raw = path.join(channelEvidence, `command-${id}.raw.txt`);
   const receiptPath = path.join(channelEvidence, `command-${id}.json`);
-  const guard = path.join(channelEvidence, "write-guard.cjs").replaceAll("\\", "/");
+  const guard = priorPreload("task-5/write-guard.cjs");
   let resolved = argv[0] === "bun" ? ["C:/Users/USER/.bun/bin/bun.exe", ...argv.slice(1)] :
     argv[0] === "bunx" ? ["C:/Users/USER/.bun/bin/bun.exe", "x", "--no-install", ...argv.slice(1)] : argv;
   if (argv[0] === "bun" && ["test", "run"].includes(argv[1]!)) {
@@ -33,7 +33,7 @@ export async function channelCommand(argv: string[], timeoutMs = 120_000) {
     end_time: null as string | null, exit_code: null as number | null, timeout_ms: timeoutMs,
     source_sha256: channelHashes(), module_sha256: {
       [bundle]: sha256(bundle), [senpi + "/dist/core/agent-session.js"]: sha256(senpi + "/dist/core/agent-session.js"),
-    }, raw_output_path: raw, fixture_identity: "attempt-20261017-e1/task-5",
+    }, raw_output_path: raw, fixture_identity: path.relative(product, channelEvidence),
     pid: undefined as number | undefined, timed_out: false, error: undefined as string | undefined,
   };
   const save = () => fs.writeFileSync(receiptPath, JSON.stringify(receipt, null, 2) + "\n");

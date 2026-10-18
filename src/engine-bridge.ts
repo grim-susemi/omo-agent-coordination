@@ -6,7 +6,7 @@ import type { NativeReplayCarrier, SettlementReceipt, SettlementRecord } from ".
 
 const CARRIER = Symbol.for("omo.agent-coordination.native.v1");
 const BARREL = Symbol.for("omo.senpi-task.senpiBarrel");
-const BASELINE = "75e2e91b945ebc19559aa7935383a1239ce4b7b5cf28589485145b564b883198";
+const BASELINE = "eb2db2c195edcf8e42dac8944535b7df85ad6e90fe1c806676573296799b2287";
 const normalize = (id: string) => id.replace(/^senpi:/, "");
 type RefusalReason = "unsupported_runtime" | "connection_failed" | "scope_denied" |
   "invalid_target" | "stale_epoch" | "stale_generation" | "runtime_mismatch" | "repair_not_enabled";

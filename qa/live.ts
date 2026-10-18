@@ -6,7 +6,7 @@ import { EventEmitter } from "node:events";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { buildAdapter, removeAdapter } from "../scripts/build-adapter.mjs";
-import { attempt, product, bundle, senpi, isolatedEnv, sha256 } from "./command.mjs";
+import { attempt, priorAttempt, product, bundle, senpi, isolatedEnv, sha256 } from "./command.mjs";
 import { getCoordinationBroker, getCoordinationClient } from "../src/public-api.ts";
 import type { CoordinationClient, Result, TargetRef } from "../src/contracts.ts";
 import { disposableModelConfig, realModelProfile } from "./model-config.ts";
@@ -59,7 +59,7 @@ function event(bus: EventEmitter, name: string, predicate: (data: any) => boolea
  * below always use the target's native ModelRuntime and physical provider route. */
 export async function runLiveCase(name: CaseName, repairDisabled = false) {
   const final = name !== "collaboration-preview" && name !== "preview-denied";
-  assert.equal(JSON.parse(fs.readFileSync(path.join(attempt, final ? "verify-9/verdict.json" : "verify-6/verdict.json"), "utf8")).verdict, "confirmed");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(priorAttempt, final ? "verify-9/verdict.json" : "verify-6/verdict.json"), "utf8")).verdict, "confirmed");
   fs.mkdirSync(liveEvidence, { recursive: true });
   const sandbox = path.join(liveEvidence, "runs", `${name}${repairDisabled ? "-repair-disabled" : ""}-${randomUUID()}`);
   const directory = path.join(sandbox, "question-package");
@@ -130,7 +130,7 @@ export async function runLiveCase(name: CaseName, repairDisabled = false) {
 export async function realProof(name: "max-reasoning-nonce" | "deep-ask-long", root: any, registry: any,
   rootRef: TargetRef, childContext: any, ask: (...args: any[]) => Promise<any>) {
   const current = liveHashes();
-  for (const source of finalRun ? [] : [path.join(liveEvidence, name + ".json"), path.join(attempt, "task-6", name + ".json")]) {
+  for (const source of finalRun ? [] : [path.join(priorAttempt, path.relative(attempt, liveEvidence), name + ".json"), path.join(priorAttempt, "task-6", name + ".json")]) {
     if (!fs.existsSync(source)) continue;
     const prior = JSON.parse(fs.readFileSync(source, "utf8"));
     if (prior.passed && fingerprint(Object.entries(prior.source_sha256).sort()) === fingerprint(Object.entries(current).sort())) {

@@ -5,14 +5,19 @@ import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { syncBuiltinESMExports } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { attempt, product, bundle, senpi, isolatedEnv, sha256 } from "../command.mjs";
+import { attempt, priorAttempt, product, bundle, senpi, isolatedEnv, sha256 } from "../command.mjs";
 import { buildAdapter, removeAdapter } from "../../scripts/build-adapter.mjs";
 import { getCoordinationBroker } from "../../src/public-api.ts";
-import { command, save } from "../../.omo/evidence/agent-coordination/attempt-20261017-e1/task-8/run.mjs";
+import { hashes } from "../../.omo/evidence/agent-coordination/attempt-20261017-e1/task-8/run.mjs";
+import { commandReceipt } from "./receipts.mjs";
 
 type Json = Record<string, any>;
 type Scenario = "auto-terminal" | "disabled" | "protected-waits";
 const evidence = path.join(attempt, "task-8");
+function save(name: string, data: unknown) {
+  fs.mkdirSync(evidence, { recursive: true });
+  fs.writeFileSync(path.join(evidence, name), JSON.stringify(data, null, 2) + "\n");
+}
 async function bounded<T>(pending: Promise<T>, label: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout>;
   try {
@@ -31,7 +36,7 @@ function event(bus: EventEmitter, name: string, predicate: (row: any) => boolean
   return pending;
 }
 export async function runAutoCase(name: "auto-terminal" | "protected-waits") {
-  assert.equal(JSON.parse(fs.readFileSync(path.join(attempt, "verify-7/verdict.json"), "utf8")).verdict, "confirmed");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(priorAttempt, "verify-7/verdict.json"), "utf8")).verdict, "confirmed");
   const results: Json[] = [];
   for (const scenario of name === "auto-terminal" ? ["auto-terminal", "disabled"] as const : ["protected-waits"] as const) {
     const sandbox = path.join(evidence, "runs", `${scenario}-${randomUUID()}`);
@@ -45,13 +50,13 @@ export async function runAutoCase(name: "auto-terminal" | "protected-waits") {
     fs.symlinkSync("C:/Users/USER/.bun/install/global/node_modules", link, "junction");
     const artifact = path.join(sandbox, "result.json");
     try {
-      const receipt = await command(["node", fileURLToPath(import.meta.url), "--native-auto", scenario,
-        "--sandbox", sandbox, "--result", artifact], `native-${scenario}-${randomUUID()}`, 55_000);
-      assert.equal(receipt.exit_code, 0, `AUTO_NATIVE_FAILED:${receipt.receipt_path}`);
+      const receipt = await commandReceipt(["node", fileURLToPath(import.meta.url), "--native-auto", scenario,
+        "--sandbox", sandbox, "--result", artifact], 55_000);
+      assert.equal(receipt.exit, 0, `AUTO_NATIVE_FAILED:${receipt.receiptPath}`);
       const report = JSON.parse(fs.readFileSync(artifact, "utf8"));
       assert.equal(report.passed, true);
       assert(report.cleanup.sessions_disposed && report.cleanup.installed_unchanged && report.cleanup.adapter_restored);
-      results.push({ ...report, command_receipt: receipt.receipt_path });
+      results.push({ ...report, command_receipt: receipt.receiptPath });
     } finally {
       if (fs.existsSync(link)) { assert(fs.lstatSync(link).isSymbolicLink()); fs.unlinkSync(link); }
     }
@@ -74,7 +79,8 @@ async function nativeAuto(scenario: Scenario, sandbox: string, artifact: string)
   const cwd = path.join(sandbox, "work"); fs.mkdirSync(path.join(cwd, ".omo"), { recursive: true }); process.chdir(cwd);
   const bus = new EventEmitter() as EventEmitter & { calls: number }; bus.calls = 0;
   (globalThis as any)[Symbol.for("coordination.auto.qa.bus")] = bus;
-  const report: Json = { scenario, sandbox, started_at: new Date().toISOString(), installed_sha256: sha256(bundle), passed: false };
+  const report: Json = { scenario, sandbox, started_at: new Date().toISOString(), source_sha256: hashes(),
+    installed_sha256: sha256(bundle), passed: false };
   const sessions: any[] = [], labels: string[] = [];
   const originalRename = fs.renameSync;
   let manifest: ReturnType<typeof buildAdapter> | undefined, state: any, stopTerminal = () => {};

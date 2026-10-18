@@ -21,7 +21,7 @@ export async function commandReceipt(argv, timeoutMs = 120_000) {
   const receiptPath = path.join(taskEvidence, `command-${id}.json`);
   const receipt = {
     argv, cwd: product, started_at: new Date().toISOString(), finished_at: null,
-    exit_code: null, timeout_ms: timeoutMs, fixture_identity: "attempt-20261017-e1/task-3",
+    exit_code: null, timeout_ms: timeoutMs, fixture_identity: path.relative(product, taskEvidence),
     source_sha256: hashes(), module_sha256: {
       [bundle]: sha256(bundle), [senpi + "/dist/core/agent-session.js"]: sha256(senpi + "/dist/core/agent-session.js"),
     }, raw_output_path: outputPath, status: "running",

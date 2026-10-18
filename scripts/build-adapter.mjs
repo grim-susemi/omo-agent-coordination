@@ -2,9 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { attempt, bundle } from "../qa/command.mjs";
+import { attempt, bundle, installedBundle } from "../qa/command.mjs";
 
-export const BASELINE = "75e2e91b945ebc19559aa7935383a1239ce4b7b5cf28589485145b564b883198";
+export const BASELINE = "eb2db2c195edcf8e42dac8944535b7df85ad6e90fe1c806676573296799b2287";
 export const CARRIER = "omo.agent-coordination.native.v1";
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const key = `globalThis[Symbol.for("${CARRIER}")]`;
@@ -48,23 +48,23 @@ export const DELTA = Object.freeze([
   },
   {
     seam: "R6: close the exact engine return expression",
-    before: "onStoreMutation:v.onMutation}}function n5(",
-    after: "onStoreMutation:v.onMutation})}function n5(",
+    before: "onStoreMutation:v.onMutation}}function E5(",
+    after: "onStoreMutation:v.onMutation})}function E5(",
   },
   {
     seam: "R7: createOutcomeTracker receives the original manager closures",
-    before: "function vH(e){let t=function(e){",
-    after: `function vH(e){${key}.outcomePorts(e);(${key}.replays??=new WeakMap).set(e.store,(...a)=>n(...a));let t=function(e){`,
+    before: "function BH(e){let t=function(e){",
+    after: `function BH(e){${key}.outcomePorts(e);(${key}.replays??=new WeakMap).set(e.store,(...a)=>n(...a));let t=function(e){`,
   },
   {
     seam: "R7: observe the native chosen terminal transition and preserve native failure cleanup",
-    before: 'function n(t,n,r,i){try{e.store.transition(t,i)}catch(i){return oc("senpi-task manager terminal record write failed"',
-    after: `function n(t,n,r,i){let __coordAttempt=${key}.terminalObservers?.get(e.store)?.(t,n,i);try{e.store.transition(t,i)}catch(i){__coordAttempt?.failed(i);return oc("senpi-task manager terminal record write failed"`,
+    before: 'function n(t,n,r,i){try{e.store.transition(t,i)}catch(i){return Fm("senpi-task manager terminal record write failed"',
+    after: `function n(t,n,r,i){let __coordAttempt=${key}.terminalObservers?.get(e.store)?.(t,n,i);try{e.store.transition(t,i)}catch(i){__coordAttempt?.failed(i);return Fm("senpi-task manager terminal record write failed"`,
   },
   {
     seam: "R7: replay-only fence in the native reducer, inside the original store record lock",
-    before: 'function Q_(e,t){if("cancel"===t.type',
-    after: 'function Q_(e,t){let __coordFence=t[Symbol.for("omo.agent-coordination.terminal-fence.v1")];if(__coordFence&&!__coordFence(e))return{applied:!1,record:e,audit:{type:"coordination_replay_fenced"}};if("cancel"===t.type',
+    before: 'function ey(e,t){if("cancel"===t.type',
+    after: 'function ey(e,t){let __coordFence=t[Symbol.for("omo.agent-coordination.terminal-fence.v1")];if(__coordFence&&!__coordFence(e))return{applied:!1,record:e,audit:{type:"coordination_replay_fenced"}};if("cancel"===t.type',
   },
   {
     seam: "R13: awaited lazy barrel readiness, before child construction",
@@ -78,13 +78,13 @@ export const DELTA = Object.freeze([
   },
   {
     seam: "R8: close native in-process turn factory capture",
-    before: "await nF(t))}},beginTurn:l}}async function tF(e)",
-    after: "await nF(t))}},beginTurn:l})}async function tF(e)",
+    before: "await lF(t))}},beginTurn:l}}async function dF(e)",
+    after: "await lF(t))}},beginTurn:l})}async function dF(e)",
   },
   {
     seam: "R6/R8: preserve runtime ownership through the native managed-handle conversion",
-    before: "function BB(e){return{task_id:e.task_id,kind:\"in-process\",sessionId:e.sessionId,pid:void 0,effectiveModel:()=>e.effectiveModel(),steer:t=>e.steer(t),followUp:t=>e.followUp(t),abort:()=>e.abort(),subscribe:t=>e.subscribe(t),waitForOutcome:()=>e.waitForIdle(),lastAssistantText:()=>e.lastAssistantText(),dispose:async()=>{await e.dispose()}}}",
-    after: `function BB(e){let t={task_id:e.task_id,kind:"in-process",sessionId:e.sessionId,pid:void 0,effectiveModel:()=>e.effectiveModel(),steer:t=>e.steer(t),followUp:t=>e.followUp(t),abort:()=>e.abort(),subscribe:t=>e.subscribe(t),waitForOutcome:()=>e.waitForIdle(),lastAssistantText:()=>e.lastAssistantText(),dispose:async()=>{await e.dispose()}};let n=${key}.runtimeOwners.get(e);return void 0!==n&&${key}.runtimeOwners.set(t,n),t}`,
+    before: "function hW(e){return{task_id:e.task_id,kind:\"in-process\",sessionId:e.sessionId,pid:void 0,effectiveModel:()=>e.effectiveModel(),steer:t=>e.steer(t),followUp:t=>e.followUp(t),abort:()=>e.abort(),subscribe:t=>e.subscribe(t),waitForOutcome:()=>e.waitForIdle(),lastAssistantText:()=>e.lastAssistantText(),dispose:async()=>{await e.dispose()}}}",
+    after: `function hW(e){let t={task_id:e.task_id,kind:"in-process",sessionId:e.sessionId,pid:void 0,effectiveModel:()=>e.effectiveModel(),steer:t=>e.steer(t),followUp:t=>e.followUp(t),abort:()=>e.abort(),subscribe:t=>e.subscribe(t),waitForOutcome:()=>e.waitForIdle(),lastAssistantText:()=>e.lastAssistantText(),dispose:async()=>{await e.dispose()}};let n=${key}.runtimeOwners.get(e);return void 0!==n&&${key}.runtimeOwners.set(t,n),t}`,
   },
   {
     seam: "R8: read session identity through the original RPC client, never launcher PID metadata",
@@ -143,12 +143,12 @@ export function buildAdapter({ input = bundle, output }) {
     removal: { backup: output + ".baseline", expected_sha256: BASELINE, hash_guarded: true },
     mode_absent: "Weak discovery only; no session/handle/SDK copy, mutation, or native outcome wrapping.",
     runtime_ownership: {
-      capture: "R8 eF(task_id, session, completion): exact session parameter, keyed by the returned runner handle",
-      propagation: "R6/R8 BB(runnerHandle): the same ownership entry, keyed by the returned ManagedChildHandle",
+      capture: "R8 aF(task_id, session, completion): exact session parameter, keyed by the returned runner handle",
+      propagation: "R6/R8 hW(runnerHandle): the same ownership entry, keyed by the returned ManagedChildHandle",
       validation: "Same live native manager/outcome handle and current task/epoch; runtime object identity, never constructor or session-ID membership",
       references: "WeakMap handle keys and WeakRef AgentSession values; native lifetime remains unchanged",
     },
-    source: "omo-ai 5.1.34; d7e224e478a4a77dba0d2104c336fdc72ad301e3 (R6/R7/R8/R13)",
+    source: "omo-ai 5.1.35 installed bundle; original semantic references d7e224e478a4a77dba0d2104c336fdc72ad301e3 (R6/R7/R8/R13)",
     license: "Installed plugin LICENSE and NOTICE apply to the input; only this small delta is product source.",
   };
   fs.mkdirSync(path.dirname(output), { recursive: true });
@@ -158,7 +158,7 @@ export function buildAdapter({ input = bundle, output }) {
   // Resolve imports to the installed modules' real paths, not a second SDK installation.
   const modules = path.join(path.dirname(output), "node_modules");
   if (!fs.existsSync(modules)) fs.symlinkSync(
-    path.resolve(path.dirname(bundle), "../../.."), modules, "junction");
+    path.resolve(path.dirname(installedBundle), "../../.."), modules, "junction");
   return manifest;
 }
 
