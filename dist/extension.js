@@ -15,7 +15,8 @@ function createRuntimeCapture(options) {
   const seen = new WeakSet;
   let disposed = false;
   let refusal;
-  let attached;
+  const attached = new Map;
+  const classes = new Set;
   const emit = (capture, event) => {
     for (const listener of listeners)
       listener(capture, event);
@@ -32,7 +33,7 @@ function createRuntimeCapture(options) {
   const bound = (runtime) => {
     if (disposed || seen.has(runtime))
       return;
-    if (!(runtime instanceof options.loaderNamespace.AgentSession) || typeof runtime.sessionId !== "string" || !runtime.sessionManager || typeof runtime.sessionManager.getLeafId !== "function" || typeof runtime.subscribe !== "function" || !runtime.modelRuntime || typeof runtime.systemPrompt !== "string" || !Array.isArray(runtime.messages) || !runtime.activitySnapshot || runtime._disposed) {
+    if (![...classes].some((AgentSession) => runtime instanceof AgentSession) || typeof runtime.sessionId !== "string" || !runtime.sessionManager || typeof runtime.sessionManager.getLeafId !== "function" || typeof runtime.subscribe !== "function" || !runtime.modelRuntime || typeof runtime.systemPrompt !== "string" || !Array.isArray(runtime.messages) || !runtime.activitySnapshot || runtime._disposed) {
       refusal = "runtime_shape";
       return;
     }
@@ -96,12 +97,12 @@ function createRuntimeCapture(options) {
     if (disposed)
       return { ok: false, reason: "stale_generation" };
     const proto = namespace?.AgentSession?.prototype;
-    const reason = options.enabled === false || process.env.OMO_AGENT_COORDINATION === "0" ? "mode_disabled" : options.loaderNamespace.VERSION !== "2026.10.16" || namespace.VERSION !== "2026.10.16" ? "version" : !proto || typeof proto.bindExtensions !== "function" || typeof proto.dispose !== "function" ? "shape" : namespace.AgentSession !== options.loaderNamespace.AgentSession ? "class_identity" : undefined;
+    const reason = options.enabled === false || process.env.OMO_AGENT_COORDINATION === "0" ? "mode_disabled" : options.loaderNamespace.VERSION !== "2026.10.16" || namespace.VERSION !== "2026.10.16" ? "version" : !proto || typeof proto.bindExtensions !== "function" || typeof proto.dispose !== "function" ? "shape" : namespace.AgentSession !== options.loaderNamespace.AgentSession && namespace.AgentSession !== options.nativeNamespace?.()?.AgentSession ? "class_identity" : undefined;
     if (reason) {
       refusal = reason;
       return { ok: false, reason: "unsupported_runtime", connection: reason };
     }
-    if (attached)
+    if (attached.has(proto))
       return { ok: true, value: undefined };
     let hook = hooks.get(proto);
     if (!hook) {
@@ -128,7 +129,8 @@ function createRuntimeCapture(options) {
       hooks.set(proto, hook);
     }
     hook.listeners.set(token, { bound, closed: close });
-    attached = { prototype: proto, hook };
+    classes.add(namespace.AgentSession);
+    attached.set(proto, hook);
     return { ok: true, value: undefined };
   };
   const status = moduleReady(options.loaderNamespace);
@@ -182,18 +184,19 @@ function createRuntimeCapture(options) {
       }
       live.clear();
       listeners.clear();
-      if (!attached)
-        return;
-      const { prototype, hook } = attached;
-      hook.listeners.delete(token);
-      if (hook.listeners.size === 0) {
-        if (prototype.bindExtensions === hook.wrapped)
-          prototype.bindExtensions = hook.original;
-        if (prototype.dispose === hook.wrappedDispose)
-          prototype.dispose = hook.originalDispose;
-        if (prototype.bindExtensions === hook.original && prototype.dispose === hook.originalDispose)
-          hooks.delete(prototype);
+      for (const [prototype, hook] of attached) {
+        hook.listeners.delete(token);
+        if (hook.listeners.size === 0) {
+          if (prototype.bindExtensions === hook.wrapped)
+            prototype.bindExtensions = hook.original;
+          if (prototype.dispose === hook.wrappedDispose)
+            prototype.dispose = hook.originalDispose;
+          if (prototype.bindExtensions === hook.original && prototype.dispose === hook.originalDispose)
+            hooks.delete(prototype);
+        }
       }
+      attached.clear();
+      classes.clear();
     }
   });
 }
@@ -289,6 +292,90 @@ function attachTaskSettlement(options) {
   };
 }
 
+// src/activity-log.ts
+import fs from "node:fs";
+import path from "node:path";
+var ACTIVITY_FILE = "coordination-activity.jsonl";
+var ACTIVITY_MAX_BYTES = 1024 * 1024;
+function shorten(text, max) {
+  const flat = Array.from(String(text ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ").replace(/\s+/g, " ").trim());
+  return flat.length > max ? flat.slice(0, max - 1).join("") + "…" : flat.join("");
+}
+var activityLabel = (text) => shorten(text, 40) || "?";
+var activityPath = (agentDir) => path.join(path.resolve(agentDir), ACTIVITY_FILE);
+function activityLine(event, now = new Date) {
+  return {
+    v: 1,
+    ts: now.toISOString(),
+    kind: event.kind,
+    from: activityLabel(event.from),
+    to: event.to === null ? null : activityLabel(event.to),
+    summary: shorten(event.summary, 160),
+    ok: event.ok,
+    ...event.phase ? { phase: event.phase } : {},
+    ...event.id ? { id: event.id } : {},
+    ...event.latency_ms !== undefined ? { latency_ms: Math.max(0, Math.round(event.latency_ms)) } : {},
+    ...event.mode ? { mode: shorten(event.mode, 16) } : {},
+    ...event.delivery ? { delivery: shorten(event.delivery, 16) } : {},
+    ...event.session ? { session: event.session } : {},
+    ...event.error ? { error: shorten(event.error, 120) } : {}
+  };
+}
+function appendActivity(agentDir, event) {
+  try {
+    if (typeof agentDir !== "string" || !agentDir)
+      return false;
+    const file = activityPath(agentDir);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    try {
+      if (fs.statSync(file).size > ACTIVITY_MAX_BYTES)
+        fs.renameSync(file, file + ".1");
+    } catch {}
+    fs.appendFileSync(file, JSON.stringify(activityLine(event, event.at ? new Date(event.at) : new Date)) + `
+`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+var ownerDirs = new WeakMap;
+var ownerPending = new WeakMap;
+function bindActivityDir(owner, agentDir) {
+  ownerDirs.set(owner, agentDir);
+  for (const event of ownerPending.get(owner) ?? [])
+    appendActivity(agentDir, event);
+  ownerPending.delete(owner);
+}
+function appendOwnerActivity(owner, event) {
+  const dir = ownerDirs.get(owner);
+  if (dir !== undefined)
+    return appendActivity(dir, event);
+  const pending = ownerPending.get(owner) ?? [];
+  if (pending.length < 32)
+    pending.push({ ...event, at: event.at ?? new Date().toISOString() });
+  ownerPending.set(owner, pending);
+  return false;
+}
+var seconds = (ms) => ms < 1000 ? "<1s" : `${Math.round(ms / 1000)}s`;
+var quoted = (text) => `"${shorten(text, 60)}"`;
+var collabLine = {
+  askSent: (from, to, question) => `▸ 협업  ${activityLabel(from)} → ${activityLabel(to)}  ${quoted(question)}  ⏳ 대기`,
+  askReply: (from, to, ok, text, ms, mode) => `▸ 협업  ${activityLabel(from)} → ${activityLabel(to)}  ${ok ? quoted(text) : shorten(text, 60)}  ` + `${ok ? "✅" : "❌"} ${seconds(ms)} (${shorten(mode, 16)})`,
+  asked: (from, question, mode) => `▸ 협업  ${activityLabel(from)}가 물음 — ${quoted(question)} (${shorten(mode, 16)}, 답 1회)`,
+  replied: (to, text) => `▸ 협업  답 보냄 → ${activityLabel(to)}  ${quoted(text)}  ✅`,
+  notified: (from, to, ok, reason) => `▸ 협업  ${activityLabel(from)} → ${activityLabel(to)}  ` + (ok ? "노트 전달(중단 없음)  \uD83D\uDCDD 다음 턴" : `노트 실패  ❌ ${shorten(reason, 40)}`)
+};
+function showCollab(ui, line) {
+  try {
+    if (!ui || typeof ui.notify !== "function")
+      return false;
+    ui.notify(line, "info");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // src/auto-reconcile.ts
 var active = new WeakSet;
 var repairActive = (bridge) => active.has(bridge);
@@ -321,6 +408,15 @@ function createAutoReconcile(options) {
     const result = bridge.reconcileOwnedTerminal(ref);
     if (!result.ok)
       attempted.delete(identity);
+    else
+      appendOwnerActivity(bridge, {
+        kind: "repair",
+        phase: "done",
+        from: "auto-repair",
+        to: null,
+        ok: true,
+        summary: `settled ${current.value.name || current.value.identity.task_id} run ${current.value.identity.run_epoch}`
+      });
   };
   const observe = (allowRepair = true) => {
     if (disposed || !options.enabled)
@@ -424,7 +520,7 @@ function attachAutoReconcile(options) {
 // src/engine-bridge.ts
 var CARRIER = Symbol.for("omo.agent-coordination.native.v1");
 var BARREL = Symbol.for("omo.senpi-task.senpiBarrel");
-var BASELINE = "75e2e91b945ebc19559aa7935383a1239ce4b7b5cf28589485145b564b883198";
+var BASELINE = "eb2db2c195edcf8e42dac8944535b7df85ad6e90fe1c806676573296799b2287";
 var normalize = (id) => id.replace(/^senpi:/, "");
 var birthHooks = new WeakMap;
 function connectEngineBridge(options) {
@@ -810,6 +906,28 @@ function connectEngineBridge(options) {
   return { ok: true, value: Object.freeze(bridge) };
 }
 
+// src/startup-warning.ts
+var CARRIER_MISSING_WARNING = "⚠ 협업 모드: 캐리어 없음 — 코디 도구 사용 불가";
+var warned = new WeakSet;
+function warnIfCarrierMissing(context, loaderNamespace, generation) {
+  if (warned.has(context.sessionManager))
+    return false;
+  const probe = connectEngineBridge({
+    context: { sessionManager: { getSessionId: () => "" } },
+    generation,
+    loaderNamespace
+  });
+  if (probe.ok || probe.connection !== "native adapter carrier")
+    return false;
+  warned.add(context.sessionManager);
+  try {
+    context.ui?.notify(CARRIER_MISSING_WARNING, "warning");
+  } catch {
+    return false;
+  }
+  return true;
+}
+
 // src/task-truth.ts
 import { randomUUID as randomUUID3 } from "node:crypto";
 function peerPolicy(role, native, asks = "allowed") {
@@ -1166,8 +1284,8 @@ function createTaskTruth(options) {
 
 // src/peer-questions.ts
 import { createHash as createHash5, randomUUID as randomUUID5 } from "node:crypto";
-import fs from "node:fs";
-import path2 from "node:path";
+import fs2 from "node:fs";
+import path3 from "node:path";
 
 // src/contracts.ts
 var REQUEST_STATES = Object.freeze([
@@ -1290,7 +1408,7 @@ var LIMITS = Object.freeze({
 // src/peer-channel.ts
 import { createHash as createHash4, randomBytes, randomUUID as randomUUID4 } from "node:crypto";
 import { createConnection, createServer } from "node:net";
-import path from "node:path";
+import path2 from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 var normalize2 = (id) => id.replace(/^senpi:/, "");
@@ -1507,7 +1625,7 @@ async function createPeerChannel(options) {
     generation,
     branch: rootSnapshot.value.branch ?? `session:${rootRuntime.sessionId}`
   });
-  const stateRoot = path.join(path.resolve(options.context.agentDir), "agent-coordination");
+  const stateRoot = path2.join(path2.resolve(options.context.agentDir), "agent-coordination");
   const address = "\\\\.\\pipe\\omo-coordination-" + digest(JSON.stringify([stateRoot, rootBinding])).slice(0, 48);
   const sockets = new Set;
   const remote = new Map;
@@ -1902,7 +2020,7 @@ async function createPeerChannel(options) {
       let processMatches = hello.value.pid === native.pid;
       if (!processMatches && Number.isSafeInteger(hello.value.pid) && hello.value.pid > 0 && Number.isSafeInteger(native.pid) && native.pid > 0) {
         try {
-          const { stdout } = await promisify(execFile)(path.join(process.env.SystemRoot ?? "C:/Windows", "System32/WindowsPowerShell/v1.0/powershell.exe"), [
+          const { stdout } = await promisify(execFile)(path2.join(process.env.SystemRoot ?? "C:/Windows", "System32/WindowsPowerShell/v1.0/powershell.exe"), [
             "-NoProfile",
             "-NonInteractive",
             "-Command",
@@ -2039,8 +2157,23 @@ var terminal2 = (state) => ["replied", "failed", "timed_out", "cancelled"].inclu
 var digest2 = (value) => createHash5("sha256").update(JSON.stringify(value, (_key, row) => row && typeof row === "object" && !Array.isArray(row) ? Object.fromEntries(Object.entries(row).sort(([a], [b]) => a.localeCompare(b))) : row)).digest("hex");
 var levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 var emptyUsage = () => ({ input: null, output: null, reasoning: null, cache: null });
-var bootstrapDirectory = (agentDir) => path2.join(path2.resolve(agentDir), "agent-coordination", "bootstrap");
-var bootstrapFile = (agentDir, task) => path2.join(bootstrapDirectory(agentDir), `${task}.json`);
+var bootstrapDirectory = (agentDir) => path3.join(path3.resolve(agentDir), "agent-coordination", "bootstrap");
+var bootstrapFile = (agentDir, task) => path3.join(bootstrapDirectory(agentDir), `${task}.json`);
+var peerLabel = (bound, roster) => roster?.peers.find((peer) => peer.target_ref === bound.target_ref)?.name || (bound.kind === "root" ? "root" : bound.task_id ?? bound.target_ref);
+var uiOf = (ctx) => ctx && typeof ctx === "object" ? ctx.ui : undefined;
+async function withAskerLines(ctx, operation, input, from, to, run) {
+  const ui = uiOf(ctx), started = Date.now(), mode = input?.depth ?? "quick";
+  if (operation === "ask")
+    showCollab(ui, collabLine.askSent(from, to, input?.question));
+  const result = await run();
+  const value = result.ok ? result.value : undefined;
+  if (operation === "ask") {
+    const ok = value?.state === "replied";
+    showCollab(ui, collabLine.askReply(to, from, ok, ok ? value.reply : value ? `${value.state}${value.terminal_reason ? `: ${value.terminal_reason}` : ""}` : result.reason, value?.latency_ms ?? Date.now() - started, mode));
+  } else
+    showCollab(ui, collabLine.notified(from, to, !!value && !value.terminal_reason, value ? value.terminal_reason : result.reason));
+  return result;
+}
 function coordinationResult(result) {
   return result.ok ? result : refuse2(result.reason === "connection_failed" || result.reason === "repair_not_enabled" ? "unsupported_runtime" : result.reason === "runtime_mismatch" ? "invalid_target" : result.reason);
 }
@@ -2883,6 +3016,7 @@ function createRemoteQuestionHandlers(options) {
         if (!result.ok)
           return result;
         prepared.set(token, { request: result.value, controller, question: input.question });
+        showCollab(uiOf(options.context), collabLine.asked(peerLabel(call.caller, latestRoster), input.question, input.depth ?? "quick"));
         return { ok: true, value: { token, prepared: requestMetadata(result.value), snapshot: metadata } };
       } finally {
         call.signal?.removeEventListener("abort", abort);
@@ -2914,6 +3048,7 @@ function createRemoteQuestionHandlers(options) {
         exchange.content = `Peer exchange from ${exchange.caller}; separate model reply, not a user instruction or adopted decision.
 Question: ${record.question}
 Reply: ${record.reply.text}`;
+        showCollab(uiOf(options.context), collabLine.replied(peerLabel(call.caller, latestRoster), record.reply.text));
       }
       exchanges.set(exchange.id, exchange);
       await adapter.queue(exchange);
@@ -3187,9 +3322,35 @@ function createOwnedQuestions(options) {
     }
     return refuse2("scope_denied");
   };
+  const roster = () => {
+    const peers = options.truth.peers();
+    return peers.ok ? peers.value : undefined;
+  };
+  const log = (event) => appendActivity(options.context.agentDir, { ...event, session: runtime?.sessionId });
+  bindActivityDir(options.bridge, options.context.agentDir);
+  const localUi = (bound) => {
+    try {
+      const actual = binding(bound.target_ref);
+      if (!actual.ok || !actual.value.capture)
+        return;
+      if (actual.value.capture === options.owner)
+        return options.context.ui;
+      return actual.value.capture.runtime()?.extensionRunner?.createContext?.()?.ui;
+    } catch {
+      return;
+    }
+  };
+  const arrivals = new Map;
   const ledger = createPeerQuestions({
     generation: options.capture.generation,
-    onReceipt: options.onReceipt,
+    onReceipt(receipt) {
+      if (receipt.state === "accepted") {
+        const key = JSON.stringify([receipt.target_ref, receipt.request_id]), arrived = arrivals.get(key);
+        arrivals.delete(key);
+        arrived?.();
+      }
+      options.onReceipt?.(receipt);
+    },
     resolve(bound) {
       const actual = binding(bound.target_ref);
       if (!actual.ok)
@@ -3246,7 +3407,57 @@ function createOwnedQuestions(options) {
   });
   const exchange = async (call) => {
     const primed = await prime(call.caller, call.target);
-    const result = !primed.ok ? primed : call.operation === "ask" ? await ledger.ask(call.caller, call.target, { ...call.payload, signal: call.signal }) : await ledger.notify(call.caller, call.target, call.payload);
+    const payload = call.payload, peers = roster(), started = Date.now();
+    const from = peerLabel(call.caller, peers), to = peerLabel(call.target, peers), mode = payload?.depth ?? "quick";
+    const key = JSON.stringify([call.target.target_ref, call.request_id]);
+    const ui = primed.ok ? localUi(call.target) : undefined, askerUi = localUi(call.caller);
+    if (call.operation === "ask") {
+      log({ kind: "ask", phase: "request", id: call.request_id, from, to, summary: payload?.question, ok: null, mode });
+      showCollab(askerUi, collabLine.askSent(from, to, payload?.question));
+      arrivals.set(key, () => {
+        showCollab(ui, collabLine.asked(from, payload?.question, mode));
+      });
+    }
+    let result;
+    try {
+      result = !primed.ok ? primed : call.operation === "ask" ? await ledger.ask(call.caller, call.target, { ...call.payload, signal: call.signal }) : await ledger.notify(call.caller, call.target, call.payload);
+    } finally {
+      arrivals.delete(key);
+    }
+    const value = result.ok ? result.value : undefined;
+    const error = value ? value.terminal_reason ? `${value.state}: ${value.terminal_reason}` : value.state : result.reason;
+    if (call.operation === "ask") {
+      const ok = value?.state === "replied";
+      log({
+        kind: "ask",
+        phase: "reply",
+        id: call.request_id,
+        from: to,
+        to: from,
+        summary: ok ? value.reply : error,
+        ok,
+        latency_ms: value?.latency_ms ?? Date.now() - started,
+        mode,
+        ...ok ? {} : { error }
+      });
+      if (ok)
+        showCollab(ui, collabLine.replied(from, value.reply));
+      showCollab(askerUi, collabLine.askReply(to, from, ok, ok ? value.reply : error, value?.latency_ms ?? Date.now() - started, mode));
+    } else {
+      const ok = !!value && !value.terminal_reason;
+      log({
+        kind: "notify",
+        phase: "done",
+        id: call.request_id,
+        from,
+        to,
+        summary: payload?.message,
+        ok,
+        delivery: "nextTurn",
+        ...ok ? {} : { error }
+      });
+      showCollab(askerUi, collabLine.notified(from, to, ok, error));
+    }
     if (call.caller.kind === "worker" && call.target.kind === "worker") {
       const state = result.ok ? result.value.state : result.reason;
       options.context.ui?.notify(`Peer ${call.caller.task_id} -> ${call.target.task_id}: ${state}`, "info");
@@ -3285,18 +3496,36 @@ function createOwnedQuestions(options) {
         const primed = await prime(call.caller);
         return primed.ok ? coordinationResult(options.truth.peers()) : primed;
       },
-      "coordination.question.inspect": async (call) => coordinationResult(await options.truth.inspect(call.payload.target_ref))
+      "coordination.question.inspect": async (call) => {
+        const ref = call.payload.target_ref;
+        return logInspect(peerLabel(call.caller, roster()), ref, coordinationResult(await options.truth.inspect(ref)));
+      }
     }
   }).then((result) => {
     if (result.ok) {
       readyChannel = result.value;
-      stopRemoteRoster = options.truth.onPeersChanged((roster) => {
+      stopRemoteRoster = options.truth.onPeersChanged((roster2) => {
         for (const remote of remotes.values())
-          remote.rosterChanged(roster);
+          remote.rosterChanged(roster2);
       });
     }
     return result;
   });
+  function logInspect(from, ref, result) {
+    const value = result.ok ? result.value : undefined;
+    const reason = String(result.reason);
+    const target = ref ? roster()?.peers.find((peer) => peer.target_ref === ref)?.name ?? ref : undefined;
+    log({
+      kind: "inspect",
+      phase: "done",
+      from,
+      to: null,
+      ok: result.ok,
+      summary: !value ? reason : value.coverage !== undefined ? `visited ${value.visited}/${value.owned}` : `${target ?? "target"} ${value.status ?? "unknown"}`,
+      ...result.ok ? {} : { error: reason }
+    });
+    return result;
+  }
   async function prime(...targets) {
     for (const bound of targets) {
       const actual = binding(bound.target_ref);
@@ -3340,18 +3569,18 @@ function createOwnedQuestions(options) {
             return refuse2("stale_generation");
           const temporary = file + "." + randomUUID5() + ".tmp";
           try {
-            fs.writeFileSync(temporary, content, { flag: "wx", mode: 384 });
-            fs.linkSync(temporary, file);
+            fs2.writeFileSync(temporary, content, { flag: "wx", mode: 384 });
+            fs2.linkSync(temporary, file);
             invitations.set(file, content);
           } finally {
-            if (fs.existsSync(temporary))
-              fs.unlinkSync(temporary);
+            if (fs2.existsSync(temporary))
+              fs2.unlinkSync(temporary);
           }
           try {
             return await opened.value.bindRemote(invitation, ref);
           } finally {
-            if (fs.existsSync(file) && fs.readFileSync(file, "utf8") === content)
-              fs.unlinkSync(file);
+            if (fs2.existsSync(file) && fs2.readFileSync(file, "utf8") === content)
+              fs2.unlinkSync(file);
             invitations.delete(file);
           }
         }).catch(() => refuse2("host_failure")).then((result) => {
@@ -3364,7 +3593,7 @@ function createOwnedQuestions(options) {
     }).catch(() => {});
   };
   if (native)
-    fs.mkdirSync(bootstrapDirectory(options.context.agentDir), { recursive: true });
+    fs2.mkdirSync(bootstrapDirectory(options.context.agentDir), { recursive: true });
   const stopNative = native?.onStoreMutation(discoverChildren);
   const stopBootstrapCapture = options.capture.onRuntime((capture, event) => {
     if (capture === options.owner && event === "changed")
@@ -3378,7 +3607,7 @@ function createOwnedQuestions(options) {
     peers: () => options.truth.peers(),
     onPeersChanged: options.truth.onPeersChanged,
     async inspect(ref) {
-      return options.truth.inspect(ref);
+      return logInspect("root", ref, await options.truth.inspect(ref));
     },
     async request(ctx, operation, input, signal) {
       const caller = bindContext(ctx);
@@ -3446,8 +3675,8 @@ function createOwnedQuestions(options) {
       ledger.dispose();
       adapters.clear();
       for (const [file, content] of invitations) {
-        if (fs.existsSync(file) && fs.readFileSync(file, "utf8") === content)
-          fs.unlinkSync(file);
+        if (fs2.existsSync(file) && fs2.readFileSync(file, "utf8") === content)
+          fs2.unlinkSync(file);
       }
       invitations.clear();
       for (const remote of remotes.values())
@@ -3463,7 +3692,7 @@ function createOwnedQuestions(options) {
 }
 async function connectManagedQuestionChild(options) {
   const sessionDirectory = process.env.SENPI_CODING_AGENT_SESSION_DIR;
-  const task = sessionDirectory && path2.basename(path2.resolve(sessionDirectory));
+  const task = sessionDirectory && path3.basename(path3.resolve(sessionDirectory));
   if (!task || !/^st_[a-zA-Z0-9]+$/.test(task))
     return refuse2("unsupported_runtime");
   const file = bootstrapFile(options.context.agentDir, task);
@@ -3481,7 +3710,7 @@ async function connectManagedQuestionChild(options) {
       };
       const read = () => {
         try {
-          finish(undefined, JSON.parse(fs.readFileSync(file, "utf8")));
+          finish(undefined, JSON.parse(fs2.readFileSync(file, "utf8")));
         } catch (error) {
           if (error.code !== "ENOENT")
             finish(error);
@@ -3494,8 +3723,8 @@ async function connectManagedQuestionChild(options) {
         abort();
         return;
       }
-      watcher = fs.watch(bootstrapDirectory(options.context.agentDir), (_event, name) => {
-        if (String(name) === path2.basename(file))
+      watcher = fs2.watch(bootstrapDirectory(options.context.agentDir), (_event, name) => {
+        if (String(name) === path3.basename(file))
           read();
       });
       watcher.on("error", finish);
@@ -3567,6 +3796,7 @@ async function createRemoteQuestionOwner(options) {
   if (!initial.ok)
     return initial;
   let roster = initial.value;
+  const accepted = new Set, inflight = new Set, refused = new Map;
   const stopClose = connection.onClose(dispose);
   const stopCapture = options.captureStore.onRuntime((capture, event) => {
     if (capture === options.capture && event === "closed")
@@ -3603,7 +3833,9 @@ async function createRemoteQuestionOwner(options) {
     },
     async request(ctx, operation, input, signal) {
       const caller = bindContext(ctx);
-      return caller.ok ? connection.request({
+      if (!caller.ok)
+        return caller;
+      const send = () => connection.request({
         operation,
         target_ref: input.target_ref,
         request_id: input.request_id,
@@ -3613,7 +3845,26 @@ async function createRemoteQuestionOwner(options) {
           signal: undefined
         },
         signal
-      }) : caller;
+      });
+      const id = String(input?.request_id);
+      if (accepted.has(id) || inflight.has(id))
+        return send();
+      const to = roster.peers.find((peer) => peer.target_ref === input?.target_ref)?.name ?? String(input?.target_ref);
+      const from = peerLabel(caller.value, roster), prior = refused.get(id);
+      inflight.add(id);
+      try {
+        const result = prior === undefined ? await withAskerLines(ctx, operation, input, from, to, send) : await send();
+        if (result.ok) {
+          accepted.add(id);
+          refused.delete(id);
+        } else
+          refused.set(id, result.reason);
+        if (prior === undefined || !result.ok && result.reason === prior)
+          return result;
+        return withAskerLines(ctx, operation, input, from, to, async () => result);
+      } finally {
+        inflight.delete(id);
+      }
     },
     setAskPolicy(ctx) {
       const caller = bindContext(ctx);
@@ -3744,7 +3995,11 @@ async function coordinationCapture(pi) {
   const previous = global2[STATE];
   await previous?.dispose();
   const generation = (previous?.generation ?? 0) + 1;
-  const capture = createRuntimeCapture({ loaderNamespace: namespace, generation });
+  const capture = createRuntimeCapture({
+    loaderNamespace: namespace,
+    generation,
+    nativeNamespace: () => global2[Symbol.for("omo.agent-coordination.native.v1")]?.module
+  });
   const bridges = new WeakMap;
   const active2 = new Set;
   const inspections = new WeakMap;
@@ -4069,6 +4324,7 @@ ${JSON.stringify(result)}` }], details: result, isError: !result.ok };
       });
   pi.on("session_start", (_event, context) => {
     contexts.set(context.sessionManager, context);
+    warnIfCarrierMissing(context, namespace, generation);
   });
   pi.on("session_shutdown", () => state.dispose());
   pi.on("session_extensions_removed", (event) => {
