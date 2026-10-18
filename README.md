@@ -3,7 +3,9 @@
 Owned root sessions and their permitted descendants can inspect work, ask a
 peer using that peer's live context, or leave a note for its next natural turn.
 This does not replace native task, task_send, task_output, or task_cancel.
-No live profile has been installed by this project.
+The 5.1.35 candidate adapter is applied to the two live bundle copies listed
+under "Live adapter targets" below; each has a hash-guarded baseline backup and
+removal restores the baseline bytes (INSTALL.md).
 
 ## Tools and working habits
 
@@ -86,7 +88,7 @@ path. Age, model text and silence do not authorize mutation.
 
 | Component | Supported candidate |
 | --- | --- |
-| OMO | omo-ai 5.1.34, pinned native bundle SHA-256 in adapter manifest |
+| OMO | omo-ai 5.1.35; baseline `eb2db2c195edcf8e42dac8944535b7df85ad6e90fe1c806676573296799b2287` (1,096,682 B) rebuilt into candidate `0dcf892f1d3ff3f1c20845516a7fed03c3b93c043e3b8bac9dffbae8f79110a6` (1,100,069 B), 12 anchors, pinned in the adapter manifest |
 | Senpi | 2026.10.16, actual loader/task namespace identity and SDK hashes checked |
 | Host | Windows, Node 24 / Bun; native process transport is an owned named pipe |
 | Other versions or shapes | Explicit unsupported; original native work remains unchanged |
@@ -96,10 +98,30 @@ Senpi is external, not vendored. See INSTALL.md for disposable install, removal,
 backup/hash checks and drift refusal. Final integration and independent review
 are separate gates; this is not a claim of final product acceptance.
 
+## Live adapter targets (candidate applied 2026-10-18)
+
+Baseline bytes: `eb2db2c195edcf8e42dac8944535b7df85ad6e90fe1c806676573296799b2287`
+(1,096,682 B). Candidate bytes: `0dcf892f1d3ff3f1c20845516a7fed03c3b93c043e3b8bac9dffbae8f79110a6`
+(1,100,069 B). Both live copies below currently hold the candidate.
+
+| Target | sha256 now | baseline backup |
+| --- | --- | --- |
+| `C:/Users/USER/.omo-stable-500/staging/memory-rollback-5.1.35-r1/package/plugin/extensions/omo-task.js` (the copy the stable-500 lane loads) | `0dcf892f1d3ff3f1c20845516a7fed03c3b93c043e3b8bac9dffbae8f79110a6` | `C:/Users/USER/.omo-stable-500/home/.omo/agent/.agent-coordination-install/adapter/omo-task.js.5135-baseline-overlay` = `eb2db2c195edcf8e42dac8944535b7df85ad6e90fe1c806676573296799b2287` |
+| `C:/Users/USER/.bun/install/global/node_modules/omo-ai/plugin/extensions/omo-task.js` (global) | `0dcf892f1d3ff3f1c20845516a7fed03c3b93c043e3b8bac9dffbae8f79110a6` | `C:/Users/USER/.omo-stable-500/home/.omo/agent/.agent-coordination-install/adapter/omo-task.js.5135-baseline-global` = `eb2db2c195edcf8e42dac8944535b7df85ad6e90fe1c806676573296799b2287` |
+
+Apply, remove and restore through the hash-guarded scripts
+`.omo/evidence/agent-coordination/attempt-5135-rebuild-e1/live-install/apply-live-install.mjs`
+and `.../remove-live-install.mjs` (commands in INSTALL.md). `remove` restores the
+baseline bytes from the backup above. Reload applies either switch, and a bundle
+change reaches new sessions only. Re-measure before quoting: these values were
+measured 2026-10-18.
+
 ## 한국어 요약
 
 같은 소유 작업 트리에서 상태 조회, 동료의 실제 문맥을 이용한 1회 질문,
 다음 자연 차례에 읽을 쪽지를 제공합니다. quick이 기본이며 deep은 매번
 명시해야 하고 대상 모델의 원래 한도와 비용을 사용합니다. 답변은 사용자
-승인이나 작업 완료 근거가 아닙니다. 실사용 프로필에는 설치하지 않았으며,
-설치·제거는 백업과 해시가 맞는 격리 시험 디렉터리에서만 수행합니다.
+승인이나 작업 완료 근거가 아닙니다. 5.1.35 후보 어댑터는 위 "Live adapter targets"의
+라이브 번들 사본 2곳에 적용돼 있고, 각각 baseline 백업과 해시 가드를 동반합니다.
+제거하면 baseline 바이트로 복원됩니다. 격리 시험 설치는 INSTALL.md의 일회용 설치기를
+사용합니다.
