@@ -12,6 +12,7 @@ import type { TaskTruth, RemoteRuntimeObservation } from "./task-truth.ts";
 import { connectRemoteRuntime, createPeerChannel } from "./peer-channel.ts";
 import type { PeerCall, PeerChannel, RemoteInvitation, RemoteRuntime } from "./peer-channel.ts";
 import type { CoordinationBroker, CoordinationClient, InspectProjection, Roster } from "./contracts.ts";
+import { appendActivity, bindActivityDir, collabLine, showCollab } from "./activity-log.ts";
 
 type Json = Record<string, any>;
 type Mutable<T> = { -readonly [P in keyof T]: T[P] };
@@ -25,6 +26,27 @@ const emptyUsage = (): Usage => ({ input: null, output: null, reasoning: null, c
 const bootstrapDirectory = (agentDir: string) => path.join(path.resolve(agentDir), "agent-coordination", "bootstrap");
 const bootstrapFile = (agentDir: string, task: string) =>
   path.join(bootstrapDirectory(agentDir), `${task}.json`);
+// Display label for activity/session lines: roster name, else task id, else root.
+const peerLabel = (bound: TargetBinding, roster?: Roster) =>
+  roster?.peers.find((peer) => peer.target_ref === bound.target_ref)?.name ||
+  (bound.kind === "root" ? "root" : (bound as Json).task_id ?? bound.target_ref);
+const uiOf = (ctx: unknown) => (ctx && typeof ctx === "object" ? (ctx as Json).ui : undefined);
+/** Asker-side `▸ 협업` lines around one ask/notify issued from this session. */
+async function withAskerLines<T>(ctx: unknown, operation: "ask" | "notify", input: Json, from: string, to: string,
+  run: () => Promise<Result<T>>): Promise<Result<T>> {
+  const ui = uiOf(ctx), started = Date.now(), mode = input?.depth ?? "quick";
+  if (operation === "ask") showCollab(ui, collabLine.askSent(from, to, input?.question));
+  const result = await run();
+  const value = result.ok ? result.value as Json : undefined;
+  if (operation === "ask") {
+    const ok = value?.state === "replied";
+    showCollab(ui, collabLine.askReply(to, from, ok, ok ? value!.reply : value ? `${value.state}${value.terminal_reason
+      ? `: ${value.terminal_reason}` : ""}` : (result as { reason: string }).reason,
+    value?.latency_ms ?? Date.now() - started, mode));
+  } else showCollab(ui, collabLine.notified(from, to, !!value && !value.terminal_reason,
+    value ? value.terminal_reason : (result as { reason: string }).reason));
+  return result;
+}
 function coordinationResult<T>(result: BridgeResult<T> | Result<T>): Result<T> {
   return result.ok ? result : refuse(result.reason === "connection_failed" || result.reason === "repair_not_enabled"
     ? "unsupported_runtime" : result.reason === "runtime_mismatch" ? "invalid_target" : result.reason);
@@ -619,7 +641,8 @@ const requestMetadata = (request: PreparedSideRequest) => ({
 
 /** The snapshot, credentials and provider stay in the authenticated native child.
  * Only metadata, the explicit question and the final answer cross the owner pipe. */
-export function createRemoteQuestionHandlers(options: { capture: CapturedRuntime; captureStore: RuntimeCapture }) {
+export function createRemoteQuestionHandlers(options: { capture: CapturedRuntime; captureStore: RuntimeCapture;
+  context?: object }) {
   type Prepared = { request: PreparedSideRequest; controller: AbortController; question: string;
     reply?: Awaited<ReturnType<PreparedSideRequest["run"]>> };
   const prepared = new Map<string, Prepared>(), exchanges = new Map<string, PeerExchange>();
@@ -701,6 +724,9 @@ export function createRemoteQuestionHandlers(options: { capture: CapturedRuntime
         if (controller.signal.aborted) return refuse("asker_aborted");
         if (!result.ok) return result;
         prepared.set(token, { request: result.value, controller, question: input.question });
+        // Answerer-side line: this child received one peer question.
+        showCollab(uiOf(options.context), collabLine.asked(peerLabel(call.caller, latestRoster),
+          input.question, input.depth ?? "quick"));
         return { ok: true, value: { token, prepared: requestMetadata(result.value), snapshot: metadata } };
       } finally { call.signal?.removeEventListener("abort", abort); }
     }
@@ -725,6 +751,7 @@ export function createRemoteQuestionHandlers(options: { capture: CapturedRuntime
         if (!record?.reply) return refuse("invalid_argument");
         (exchange as Mutable<PeerExchange>).content =
           `Peer exchange from ${exchange.caller}; separate model reply, not a user instruction or adopted decision.\nQuestion: ${record.question}\nReply: ${record.reply.text}`;
+        showCollab(uiOf(options.context), collabLine.replied(peerLabel(call.caller, latestRoster), record.reply.text));
       }
       exchanges.set(exchange.id, exchange);
       await adapter.queue(exchange);
@@ -942,8 +969,31 @@ export function createOwnedQuestions(options: {
     }
     return refuse("scope_denied");
   };
+  // Activity/session lines. The owner hosts the single ledger, so each event is
+  // logged exactly once here even when asker or answerer is a remote child.
+  const roster = () => { const peers = options.truth.peers(); return peers.ok ? peers.value : undefined; };
+  const log = (event: Parameters<typeof appendActivity>[1]) =>
+    appendActivity(options.context.agentDir, { ...event, session: runtime?.sessionId });
+  bindActivityDir(options.bridge, options.context.agentDir); // auto-repair logs against this bridge
+  // UI of a session hosted in this process; remote children show their own lines.
+  const localUi = (bound: TargetBinding) => {
+    try {
+      const actual = binding(bound.target_ref);
+      if (!actual.ok || !actual.value.capture) return undefined;
+      if (actual.value.capture === options.owner) return options.context.ui;
+      return (actual.value.capture.runtime() as Json | undefined)?.extensionRunner?.createContext?.()?.ui;
+    } catch { return undefined; }
+  };
+  const arrivals = new Map<string, () => void>();
   const ledger = createPeerQuestions({
-    generation: options.capture.generation, onReceipt: options.onReceipt,
+    generation: options.capture.generation,
+    onReceipt(receipt) {
+      if (receipt.state === "accepted") {
+        const key = JSON.stringify([receipt.target_ref, receipt.request_id]), arrived = arrivals.get(key);
+        arrivals.delete(key); arrived?.();
+      }
+      options.onReceipt?.(receipt);
+    },
     resolve(bound) {
       const actual = binding(bound.target_ref);
       if (!actual.ok) return actual;
@@ -990,9 +1040,39 @@ export function createOwnedQuestions(options: {
   });
   const exchange = async (call: PeerCall) => {
     const primed = await prime(call.caller, call.target);
-    const result = !primed.ok ? primed : call.operation === "ask"
-      ? await ledger.ask(call.caller, call.target, { ...(call.payload as AskInput), signal: call.signal })
-      : await ledger.notify(call.caller, call.target, call.payload as any);
+    const payload = call.payload as Json, peers = roster(), started = Date.now();
+    const from = peerLabel(call.caller, peers), to = peerLabel(call.target, peers), mode = payload?.depth ?? "quick";
+    const key = JSON.stringify([call.target.target_ref, call.request_id]);
+    // This handler runs once per actual event (the channel ledger serves replays),
+    // so asker and answerer lines here cannot repeat for one request_id.
+    const ui = primed.ok ? localUi(call.target) : undefined, askerUi = localUi(call.caller);
+    if (call.operation === "ask") {
+      log({ kind: "ask", phase: "request", id: call.request_id, from, to, summary: payload?.question, ok: null, mode });
+      showCollab(askerUi, collabLine.askSent(from, to, payload?.question));
+      arrivals.set(key, () => { showCollab(ui, collabLine.asked(from, payload?.question, mode)); });
+    }
+    let result: Result<AskResult | RequestReceipt>;
+    try {
+      result = !primed.ok ? primed : call.operation === "ask"
+        ? await ledger.ask(call.caller, call.target, { ...(call.payload as AskInput), signal: call.signal })
+        : await ledger.notify(call.caller, call.target, call.payload as any);
+    } finally { arrivals.delete(key); }
+    const value = result.ok ? result.value as Json : undefined;
+    const error = value ? value.terminal_reason ? `${value.state}: ${value.terminal_reason}` : value.state
+      : (result as { reason: string }).reason;
+    if (call.operation === "ask") {
+      const ok = value?.state === "replied";
+      log({ kind: "ask", phase: "reply", id: call.request_id, from: to, to: from, summary: ok ? value!.reply : error,
+        ok, latency_ms: value?.latency_ms ?? Date.now() - started, mode, ...(ok ? {} : { error }) });
+      if (ok) showCollab(ui, collabLine.replied(from, value!.reply));
+      showCollab(askerUi, collabLine.askReply(to, from, ok, ok ? value!.reply : error,
+        value?.latency_ms ?? Date.now() - started, mode));
+    } else {
+      const ok = !!value && !value.terminal_reason;
+      log({ kind: "notify", phase: "done", id: call.request_id, from, to, summary: payload?.message, ok,
+        delivery: "nextTurn", ...(ok ? {} : { error }) });
+      showCollab(askerUi, collabLine.notified(from, to, ok, error));
+    }
     if (call.caller.kind === "worker" && call.target.kind === "worker") {
       const state = result.ok ? result.value.state : result.reason;
       options.context.ui?.notify(`Peer ${call.caller.task_id} -> ${call.target.task_id}: ${state}`, "info");
@@ -1023,8 +1103,11 @@ export function createOwnedQuestions(options: {
         const primed = await prime(call.caller);
         return primed.ok ? coordinationResult(options.truth.peers()) : primed;
       },
-      "coordination.question.inspect": async (call) =>
-        coordinationResult(await options.truth.inspect((call.payload as Json).target_ref)),
+      "coordination.question.inspect": async (call) => {
+        const ref = (call.payload as Json).target_ref;
+        return logInspect(peerLabel(call.caller, roster()), ref,
+          coordinationResult(await options.truth.inspect(ref)));
+      },
     },
   }).then((result) => {
     if (result.ok) {
@@ -1035,6 +1118,16 @@ export function createOwnedQuestions(options: {
     }
     return result;
   });
+  function logInspect<R extends { readonly ok: boolean }>(from: string, ref: TargetRef | undefined, result: R): R {
+    const value = result.ok ? (result as unknown as { value: Json }).value : undefined;
+    const reason = String((result as unknown as { reason?: string }).reason);
+    const target = ref ? roster()?.peers.find((peer) => peer.target_ref === ref)?.name ?? ref : undefined;
+    log({ kind: "inspect", phase: "done", from, to: null, ok: result.ok,
+      summary: !value ? reason : value.coverage !== undefined
+        ? `visited ${value.visited}/${value.owned}` : `${target ?? "target"} ${value.status ?? "unknown"}`,
+      ...(result.ok ? {} : { error: reason }) });
+    return result;
+  }
   async function prime(...targets: TargetBinding[]): Promise<Result<void>> {
     for (const bound of targets) {
       const actual = binding(bound.target_ref);
@@ -1103,7 +1196,8 @@ export function createOwnedQuestions(options: {
     bindContext, asks: ledger.asks, transport,
     peers: () => options.truth.peers() as Result<Roster>,
     onPeersChanged: options.truth.onPeersChanged,
-    async inspect(ref?: TargetRef) { return options.truth.inspect(ref); },
+    // The registered inspect tool passes no caller context; label it by this owner.
+    async inspect(ref?: TargetRef) { return logInspect("root", ref, await options.truth.inspect(ref)); },
     async request(ctx: unknown, operation: "ask" | "notify", input: any, signal?: AbortSignal) {
       const caller = bindContext(ctx);
       if (!caller.ok) return caller;
@@ -1246,6 +1340,7 @@ export async function createRemoteQuestionOwner(options: {
     target_ref: connection.root_ref, request_id: randomUUID(), payload: null });
   if (!initial.ok) return initial;
   let roster = initial.value as Roster;
+  const accepted = new Set<string>(), inflight = new Set<string>(), refused = new Map<string, string>();
   const stopClose = connection.onClose(dispose);
   const stopCapture = options.captureStore.onRuntime((capture, event) => {
     if (capture === options.capture && event === "closed") dispose();
@@ -1267,9 +1362,26 @@ export async function createRemoteQuestionOwner(options: {
     },
     async request(ctx, operation, input, signal) {
       const caller = bindContext(ctx);
-      return caller.ok ? connection.request({ operation, target_ref: input.target_ref,
+      if (!caller.ok) return caller;
+      const send = () => connection.request({ operation, target_ref: input.target_ref,
         request_id: input.request_id, payload: { ...input,
-          ...(operation === "ask" ? { depth: input.depth ?? "quick" } : {}), signal: undefined }, signal }) : caller;
+          ...(operation === "ask" ? { depth: input.depth ?? "quick" } : {}), signal: undefined }, signal });
+      // The owner's channel ledger answers a repeated request_id from its cache, but
+      // a refusal before ledger insertion is not cached and a later same-id call can
+      // execute for the first time. An id counts as displayed once the owner returned
+      // a receipt (accepted). After a refusal, a same-id retry shows lines only when
+      // its outcome differs; an identical refusal is a cached or repeated refusal.
+      const id = String(input?.request_id);
+      if (accepted.has(id) || inflight.has(id)) return send();
+      const to = roster.peers.find((peer) => peer.target_ref === input?.target_ref)?.name ?? String(input?.target_ref);
+      const from = peerLabel(caller.value, roster), prior = refused.get(id);
+      inflight.add(id);
+      try {
+        const result = prior === undefined ? await withAskerLines(ctx, operation, input, from, to, send) : await send();
+        if (result.ok) { accepted.add(id); refused.delete(id); } else refused.set(id, result.reason);
+        if (prior === undefined || (!result.ok && result.reason === prior)) return result;
+        return withAskerLines(ctx, operation, input, from, to, async () => result);
+      } finally { inflight.delete(id); }
     },
     setAskPolicy(ctx) {
       const caller = bindContext(ctx);

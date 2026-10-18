@@ -5,6 +5,10 @@ import type { TargetRef } from "../src/contracts.ts";
 import { projectTask } from "../src/task-truth.ts";
 import { publishQuestionBroker } from "../src/peer-questions.ts";
 import type { NativeReplayCarrier } from "../src/task-settlement.ts";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { ACTIVITY_FILE, bindActivityDir } from "../src/activity-log.ts";
 
 // Boundary doubles test event selection only. The owned cases separately load
 // the actual SDK, engine, store, native runner and original replay closure.
@@ -137,4 +141,36 @@ test("a rejected early replay is eligible again when the native terminal event e
   f.auto.observe(); f.finish(); expect(f.mutations()).toBe(0);
   f.bridge.reconcileOwnedTerminal = original;
   f.auto.observe(); f.auto.observe(); expect(f.mutations()).toBe(1); f.auto.dispose();
+});
+
+const activity = (dir: string) => fs.existsSync(path.join(dir, ACTIVITY_FILE))
+  ? fs.readFileSync(path.join(dir, ACTIVITY_FILE), "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
+
+test("a successful repair appends exactly one repair activity line, flushed once the owner dir is bound", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "coordination-repair-"));
+  try {
+    const f = fixture();
+    f.auto.observe(); f.finish();
+    expect(f.mutations()).toBe(1);
+    expect(activity(dir)).toHaveLength(0);
+    bindActivityDir(f.bridge, dir);
+    for (let i = 0; i < 3; i++) { f.auto.observe(); f.finish(); }
+    const lines = activity(dir);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ v: 1, kind: "repair", phase: "done", from: "auto-repair", to: null, ok: true,
+      summary: "settled worker run 1" });
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a failed repair or no proven candidate appends no repair line", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "coordination-repair-"));
+  try {
+    const failed = fixture(); bindActivityDir(failed.bridge, dir);
+    failed.bridge.reconcileOwnedTerminal = () => ({ ok: false, reason: "repair_not_enabled" });
+    failed.auto.observe(); failed.finish();
+    const none = fixture(); bindActivityDir(none.bridge, dir);
+    none.auto.observe(); none.auto.observe();
+    expect(none.mutations()).toBe(0);
+    expect(activity(dir)).toHaveLength(0);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

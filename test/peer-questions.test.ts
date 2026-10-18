@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { connectManagedQuestionChild, createPeerQuestions, nativeQuestionTarget, sideThinkingOptions } from "../src/peer-questions.ts";
+import { connectManagedQuestionChild, createPeerQuestions, createRemoteQuestionOwner, nativeQuestionTarget, sideThinkingOptions } from "../src/peer-questions.ts";
 import fs from "node:fs";
 import path from "node:path";
 import type { PeerExchange, QuestionTarget, SideSnapshot } from "../src/peer-questions.ts";
@@ -480,3 +480,80 @@ test("registered tool and transport cached requests revalidate current ask polic
     allow_from_cached_result_preserved: true, default_cached_result_preserved: true,
   });
 }, 60_000);
+
+test("a replayed request_id from a child session shows no second set of asker lines", async () => {
+  const sessionManager = {}, lines: string[] = [], cache = new Map<string, unknown>();
+  let sent = 0;
+  const ctx = { sessionManager, ui: { notify: (message: string) => { lines.push(message); } } };
+  const capture = { runtime: () => ({ sessionManager }) } as any;
+  const captureStore = { forRuntime: () => ({ ok: true, value: capture }), onRuntime: () => () => {} } as any;
+  const connection = {
+    binding: { kind: "worker", target_ref: "coordination:a", task_id: "a" }, root_ref: "coordination:root",
+    isCurrent: () => true, onClose: () => () => {}, dispose() {},
+    async request(request: any) {
+      if (request.operation === "coordination.question.peers") return { ok: true, value: { revision: 1, peers: [
+        { target_ref: "coordination:root", name: "root", role: "root" }, { target_ref: "coordination:a", name: "a", role: "explore" }] } };
+      // Owner-side channel ledger: one execution per request_id, replays served from cache.
+      if (!cache.has(request.request_id)) {
+        sent++;
+        cache.set(request.request_id, request.operation === "ask"
+          ? { ok: true, value: { state: "replied", reply: "answer", latency_ms: 3000 } }
+          : { ok: true, value: { state: "delivered", incorporation: "queued_for_next_turn" } });
+      }
+      return cache.get(request.request_id);
+    },
+  } as any;
+  const created = await createRemoteQuestionOwner({ context: ctx, capture, captureStore, connection });
+  if (!created.ok) throw new Error(created.reason);
+  const owner = created.value.owner;
+  const ask = { target_ref: "coordination:root", request_id: "q-1", question: "status?" };
+  expect(await owner.request(ctx, "ask", ask)).toEqual(await owner.request(ctx, "ask", ask));
+  expect(lines).toEqual(["▸ 협업  a → root  \"status?\"  ⏳ 대기", "▸ 협업  root → a  \"answer\"  ✅ 3s (quick)"]);
+  const note = { target_ref: "coordination:root", request_id: "n-1", message: "fyi" };
+  await owner.request(ctx, "notify", note); await owner.request(ctx, "notify", note);
+  expect(lines.slice(2)).toEqual(["▸ 협업  a → root  노트 전달(중단 없음)  📝 다음 턴"]);
+  expect(sent).toBe(2);
+  created.value.dispose();
+});
+
+test("a child request refused before owner acceptance still shows lines when the same request_id later executes", async () => {
+  const sessionManager = {}, lines: string[] = [], cache = new Map<string, unknown>();
+  let sent = 0, denyOnce = true;
+  const ctx = { sessionManager, ui: { notify: (message: string) => { lines.push(message); } } };
+  const capture = { runtime: () => ({ sessionManager }) } as any;
+  const captureStore = { forRuntime: () => ({ ok: true, value: capture }), onRuntime: () => () => {} } as any;
+  const connection = {
+    binding: { kind: "worker", target_ref: "coordination:a", task_id: "a" }, root_ref: "coordination:root",
+    isCurrent: () => true, onClose: () => () => {}, dispose() {},
+    async request(request: any) {
+      if (request.operation === "coordination.question.peers") return { ok: true, value: { revision: 1, peers: [
+        { target_ref: "coordination:root", name: "root", role: "root" }, { target_ref: "coordination:a", name: "a", role: "explore" }] } };
+      // Channel pre-ledger refusals (validation/authorization) are not cached.
+      if (request.target_ref === "coordination:bad") return { ok: false, reason: "invalid_target" };
+      if (request.request_id === "q-auth" && denyOnce) { denyOnce = false; return { ok: false, reason: "target_excluded" }; }
+      if (!cache.has(request.request_id)) {
+        sent++;
+        cache.set(request.request_id, request.request_id === "q-busy" ? { ok: false, reason: "target_busy" }
+          : { ok: true, value: { state: "replied", reply: "answer", latency_ms: 3000 } });
+      }
+      return cache.get(request.request_id);
+    },
+  } as any;
+  const created = await createRemoteQuestionOwner({ context: ctx, capture, captureStore, connection });
+  if (!created.ok) throw new Error(created.reason);
+  const owner = created.value.owner;
+  const ask = (request_id: string, target_ref = "coordination:root") => owner.request(ctx, "ask", { target_ref, request_id, question: "status?" });
+  const success = ["▸ 협업  a → root  \"status?\"  ⏳ 대기", "▸ 협업  root → a  \"answer\"  ✅ 3s (quick)"];
+  await ask("q-x", "coordination:bad");
+  expect(lines).toEqual(["▸ 협업  a → coordination:bad  \"status?\"  ⏳ 대기", "▸ 협업  coordination:bad → a  invalid_target  ❌ <1s (quick)"]);
+  expect((await ask("q-x")).ok).toBe(true);
+  expect(lines.slice(2)).toEqual(success);
+  await ask("q-x");
+  expect(lines).toHaveLength(4);
+  await ask("q-auth"); await ask("q-auth");
+  expect(lines.slice(4)).toEqual(["▸ 협업  a → root  \"status?\"  ⏳ 대기", "▸ 협업  root → a  target_excluded  ❌ <1s (quick)", ...success]);
+  await ask("q-busy"); await ask("q-busy");
+  expect(lines.slice(8)).toEqual(["▸ 협업  a → root  \"status?\"  ⏳ 대기", "▸ 협업  root → a  target_busy  ❌ <1s (quick)"]);
+  expect(sent).toBe(3);
+  created.value.dispose();
+});

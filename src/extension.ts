@@ -1,6 +1,7 @@
 import { createRuntimeCapture } from "./runtime-capture.ts";
 import type { RuntimeCapture } from "./runtime-capture.ts";
 import { connectEngineBridge } from "./engine-bridge.ts";
+import { warnIfCarrierMissing } from "./startup-warning.ts";
 import { repairActive } from "./auto-reconcile.ts";
 import type { EngineBridge, SenpiNamespace } from "./engine-bridge.ts";
 import { createTaskTruth, peerPolicy } from "./task-truth.ts";
@@ -312,7 +313,10 @@ export default async function coordinationCapture(pi: ExtensionAPI) {
       return { content: [{ type: "text", text: `${summary(result)}\n${JSON.stringify(result)}` }], details: result, isError: !result.ok };
     },
   });
-  pi.on("session_start", (_event, context) => { contexts.set(context.sessionManager, context); });
+  pi.on("session_start", (_event, context) => {
+    contexts.set(context.sessionManager, context);
+    warnIfCarrierMissing(context as never, namespace, generation);
+  });
   pi.on("session_shutdown", () => state.dispose());
   pi.on("session_extensions_removed", (event) => {
     const removed = (event as { removed: { path: string; resolvedPath: string }[] }).removed;

@@ -1,6 +1,7 @@
 import type { EngineBridge, OwnedSnapshot } from "./engine-bridge.ts";
 import type { NativeReplayCarrier, SettlementRecord } from "./task-settlement.ts";
 import type { TargetRef } from "./contracts.ts";
+import { appendOwnerActivity } from "./activity-log.ts";
 
 const active = new WeakSet<EngineBridge>();
 export const repairActive = (bridge: EngineBridge) => active.has(bridge);
@@ -38,6 +39,8 @@ export function createAutoReconcile(options: { bridge: EngineBridge; enabled: bo
     attempted.add(identity);
     const result = bridge.reconcileOwnedTerminal(ref);
     if (!result.ok) attempted.delete(identity);
+    else appendOwnerActivity(bridge, { kind: "repair", phase: "done", from: "auto-repair", to: null, ok: true,
+      summary: `settled ${current.value.name || current.value.identity.task_id} run ${current.value.identity.run_epoch}` });
   };
   const observe = (allowRepair = true) => {
     if (disposed || !options.enabled) return;
