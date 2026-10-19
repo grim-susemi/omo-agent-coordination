@@ -99,12 +99,23 @@ export default async function coordinationCapture(pi: ExtensionAPI) {
   }>();
   let disposed = false;
   let disposal: Promise<void> | undefined;
+  // exposeTools runs on every agent event, and listOwned stats every owned task record
+  // synchronously, so this path reuses one listing per bridge for a short window.
+  const OWNED_LISTING_TTL_MS = 1000;
+  const ownedListings = new WeakMap<object, { at: number; listed: ReturnType<EngineBridge["listOwned"]> }>();
+  const listOwnedRecent = (bridge: EngineBridge) => {
+    const now = Date.now(), cached = ownedListings.get(bridge);
+    if (cached && now - cached.at < OWNED_LISTING_TTL_MS) return cached.listed;
+    const listed = bridge.listOwned();
+    ownedListings.set(bridge, { at: now, listed });
+    return listed;
+  };
   const exposeTools = (captured: Parameters<Parameters<typeof capture.onRuntime>[0]>[0]) => {
       const runtime = captured.runtime() as any;
       if (disposed || !runtime || typeof runtime.setActiveToolsByName !== "function") return false;
       if (bridges.has(runtime.sessionManager)) return true;
       for (const bridge of active) {
-        const listed = bridge.listOwned();
+        const listed = listOwnedRecent(bridge);
         if (!listed.ok) continue;
         for (const snapshot of listed.value) {
           if (!peerPolicy(snapshot.role, snapshot.collaboration).ask_capability) continue;

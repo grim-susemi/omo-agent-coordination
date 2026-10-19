@@ -352,6 +352,90 @@ test("request-local options cap supported wire families and never change the inp
     .toEqual({ ok: false, reason: "reasoning_policy_unsupported" });
   expect(sideThinkingOptions({ api: "openai-responses", reasoning: true, maxTokens: 32000,
     thinkingLevelMap: { low: null } }, "high", "quick").ok).toBe(false);
+  const subscription = { api: "claude-sdk-oauth", reasoning: true, maxTokens: 128000,
+    thinkingLevelMap: { off: null, minimal: null, low: "low", high: "high", xhigh: "xhigh", max: "max" } };
+  expect(value(sideThinkingOptions(subscription, "xhigh", "quick"))).toEqual({
+    thinking: "low", outputBudget: 4096, reasoningBudget: null, options: { reasoning: "low" } });
+  expect(value(sideThinkingOptions(subscription, "xhigh", "deep"))).toEqual({
+    thinking: "xhigh", outputBudget: 128000, reasoningBudget: null, options: { reasoning: "xhigh" } });
+  expect(sideThinkingOptions(subscription, "off", "quick")).toEqual({ ok: false, reason: "reasoning_policy_unsupported" });
+});
+
+test("the Claude subscription lane runs one tool-less low-effort side query and caps the visible reply on the stream", async () => {
+  const model = { id: "claude-opus-5-5", provider: "anthropic-subscription", api: "claude-sdk-oauth", reasoning: true,
+    contextWindow: 600000, maxTokens: 128000,
+    thinkingLevelMap: { off: null, minimal: null, low: "low", high: "high", xhigh: "xhigh", max: "max" } };
+  for (const [deltas, expected] of [
+    [["짧은 ", "답"], { text: "짧은 답", completion: "complete" }],
+    [["가".repeat(1000), "나".repeat(1000), "다".repeat(1000)], { completion: "truncated_by_client" }],
+  ] as const) {
+    const f = fixture();
+    let calls = 0, seen: any, streamSignal: AbortSignal | undefined, delivered = 0;
+    const runtime: any = {
+      sessionId: "main-session", thinkingLevel: "xhigh", messages: [], _pendingNextTurnMessages: [],
+      sessionManager: { getBranch: () => [{ id: "base" }] },
+      sendCustomMessage() {},
+      agent: { state: { tools: [{ name: "bash", description: "shell", parameters: {} }] },
+        convertToLlm: async (messages: unknown[]) => messages },
+      extensionRunner: { createContext: () => ({
+        prepareProviderRequest: async (messages: unknown[]) => ({ messages,
+          transformHeaders: async (headers: unknown) => headers, transformPayload: async (body: unknown) => body }),
+      }) },
+      modelRuntime: {
+        getCompatibilityRequestConfig: () => ({}),
+        // The main's own request options: the side query must replace reasoning and never inherit streamKind.
+        prepareSimpleRequest: async () => ({ model, options: { reasoning: "xhigh", streamKind: "main" } }),
+        stream(_model: unknown, context: any, options: any) {
+          calls++; seen = { context, options }; streamSignal = options.signal;
+          let text = "";
+          let finish!: (message: unknown) => void;
+          const result = new Promise((resolve) => { finish = resolve; });
+          return {
+            async *[Symbol.asyncIterator]() {
+              for (const delta of deltas) {
+                if (options.signal.aborted) break;
+                text += delta; delivered++;
+                yield { type: "text_delta", delta };
+              }
+              finish({ stopReason: options.signal.aborted ? "aborted" : "stop",
+                content: [{ type: "text", text }], usage: { input: 11, output: 7 } });
+            },
+            result: () => result,
+          };
+        },
+      },
+    };
+    const capture: any = {
+      runtime: () => runtime,
+      read: () => ({ ok: true, value: { revision: 1, observed_at: new Date(1000).toISOString(), branch: "base",
+        model, system_prompt: "Unit subscription context", messages: [], model_runtime: runtime.modelRuntime } }),
+    };
+    const adapter = nativeQuestionTarget({ binding: f.a.binding, capture,
+      validate: () => ({ ok: true, value: undefined }), subscribe: () => () => {} });
+    const caller = new AbortController();
+    const prepared = value(await adapter.prepare(value(adapter.read()), "상태 한 줄로", [], "quick", caller.signal));
+    const reply = await prepared.run();
+    expect(calls).toBe(1);
+    expect(reply.attempts).toBe(1);
+    expect(reply.completion).toBe(expected.completion);
+    if ("text" in expected) expect(reply.text).toBe(expected.text);
+    else {
+      expect(Buffer.byteLength(reply.text)).toBeLessThanOrEqual(4096);
+      expect(reply.text.startsWith("가".repeat(1000))).toBe(true);
+      expect(streamSignal!.aborted).toBe(true);
+      expect(delivered).toBe(2);
+    }
+    expect(caller.signal.aborted).toBe(false);
+    expect(seen.options).toMatchObject({ reasoning: "low", toolChoice: "none", maxRetries: 0 });
+    expect(seen.options.streamKind).toBeUndefined();
+    expect(seen.options.sessionId).toMatch(/^main-session:peer:/);
+    expect(seen.context.tools).toEqual([]);
+    expect(prepared.thinking).toBe("low");
+    expect(prepared.controls).toMatchObject({ output_cap: "client_abort", wire_output_budget: null,
+      lane_internal_retry: "possible" });
+    expect(runtime.thinkingLevel).toBe("xhigh");
+    f.q.dispose();
+  }
 });
 
 test("final native payload controls override alias extraBody and extension changes without touching main options", async () => {

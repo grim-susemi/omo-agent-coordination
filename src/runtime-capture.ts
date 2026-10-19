@@ -39,6 +39,8 @@ export interface RuntimeSnapshot {
 export interface CapturedRuntime {
   readonly runtime_instance_id: string;
   runtime(): LiveSession | undefined;
+  /** Same verdict as `read().ok` without cloning and hashing the conversation. */
+  alive(): boolean;
   read(): CaptureResult<RuntimeSnapshot>;
 }
 interface Prototype {
@@ -107,6 +109,11 @@ export function createRuntimeCapture(options: {
     const capture: CapturedRuntime = Object.freeze({
       runtime_instance_id: instance,
       runtime: () => disposed || closed ? undefined : ref.deref(),
+      alive(): boolean {
+        if (disposed || refusal) return false;
+        const actual = ref.deref();
+        return !closed && !!actual && !actual._disposed && !!actual.model;
+      },
       read(): CaptureResult<RuntimeSnapshot> {
         if (disposed) return { ok: false, reason: "stale_generation" };
         if (refusal) return { ok: false, reason: "unsupported_runtime", connection: refusal };
@@ -142,7 +149,7 @@ export function createRuntimeCapture(options: {
     if (disposed) return { ok: false, reason: "stale_generation" };
     const proto = namespace?.AgentSession?.prototype as unknown as Prototype | undefined;
     const reason = options.enabled === false || process.env.OMO_AGENT_COORDINATION === "0" ? "mode_disabled" :
-      options.loaderNamespace.VERSION !== "2026.10.16" || namespace.VERSION !== "2026.10.16" ? "version" :
+      options.loaderNamespace.VERSION !== "2026.10.19" || namespace.VERSION !== "2026.10.19" ? "version" :
       !proto || typeof proto.bindExtensions !== "function" || typeof proto.dispose !== "function" ? "shape" :
       namespace.AgentSession !== options.loaderNamespace.AgentSession &&
         namespace.AgentSession !== options.nativeNamespace?.()?.AgentSession ? "class_identity" : undefined;

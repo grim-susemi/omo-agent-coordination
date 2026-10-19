@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const product = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-export const attempt = path.join(product, ".omo/evidence/agent-coordination/attempt-5135-rebuild-e1");
+export const attempt = path.join(product, ".omo/evidence/agent-coordination/attempt-5138-rebuild-e1");
 export const priorAttempt = path.join(product, ".omo/evidence/agent-coordination/attempt-20261017-e1");
 export const evidence = path.join(attempt, "task-1");
 export const senpi = "C:/Users/USER/.bun/install/global/node_modules/@code-yeongyu/senpi";

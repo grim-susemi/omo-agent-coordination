@@ -16,9 +16,9 @@ test("capture accepts the exact lazy native SDK class alongside the bundled load
     dispose() {}
     subscribe() { return () => {}; }
   };
-  const loader = { AgentSession: sessionClass(), VERSION: "2026.10.16" };
-  const native = { AgentSession: sessionClass(), VERSION: "2026.10.16" };
-  const foreign = { AgentSession: sessionClass(), VERSION: "2026.10.16" };
+  const loader = { AgentSession: sessionClass(), VERSION: "2026.10.19" };
+  const native = { AgentSession: sessionClass(), VERSION: "2026.10.19" };
+  const foreign = { AgentSession: sessionClass(), VERSION: "2026.10.19" };
   let attested: typeof native | undefined;
   const options = { loaderNamespace: loader, generation: 1, nativeNamespace: () => attested };
   const originalLoader = loader.AgentSession.prototype.bindExtensions;
@@ -36,8 +36,15 @@ test("capture accepts the exact lazy native SDK class alongside the bundled load
     expect(capture.list()).toHaveLength(2);
     const childCapture = capture.forRuntime(child);
     expect(childCapture.ok).toBe(true);
-    if (childCapture.ok) expect(childCapture.value.read().ok).toBe(true);
+    if (childCapture.ok) {
+      expect(childCapture.value.read().ok).toBe(true);
+      expect(childCapture.value.alive()).toBe(true);
+    }
     child.dispose();
+    if (childCapture.ok) {
+      expect(childCapture.value.alive()).toBe(false);
+      expect(childCapture.value.read().ok).toBe(false);
+    }
     expect(capture.forRuntime(child)).toEqual({ ok: false, reason: "capture_missing" });
   } finally { capture.dispose(); }
   expect(loader.AgentSession.prototype.bindExtensions).toBe(originalLoader);

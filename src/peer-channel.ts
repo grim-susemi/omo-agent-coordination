@@ -601,7 +601,7 @@ export async function connectRemoteRuntime(options: {
   void wire.finished.promise.then(() => options.onDisconnect?.());
   return { ok: true as const, value: Object.freeze({
     binding: value.binding, root_ref: value.root_ref,
-    isCurrent: () => !wire.isClosed && options.capture.runtime() === runtime && options.capture.read().ok,
+    isCurrent: () => !wire.isClosed && options.capture.runtime() === runtime && options.capture.alive(),
     emit(event: unknown) { return wire.call({ kind: "event", value: event }); },
     onClose(listener: () => void) {
       let active = true;

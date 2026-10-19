@@ -162,7 +162,7 @@ export interface RequestReceipt {
 export interface AskResult extends RequestReceipt {
   readonly depth: Depth;
   readonly reply?: string;
-  readonly completion?: "complete" | "truncated_by_provider";
+  readonly completion?: "complete" | "truncated_by_provider" | "truncated_by_client";
   readonly ended_by?: EndedBy;
   readonly side_thinking_policy: SideThinkingPolicy;
   readonly target_thinking_before: string;

@@ -70,7 +70,7 @@ export interface PreparedSideRequest {
   readonly attempts?: number;
   readonly snapshot?: SideSnapshot;
   release?(): void;
-  run(): Promise<{ text: string; toolCalls: boolean; completion: "complete" | "truncated_by_provider";
+  run(): Promise<{ text: string; toolCalls: boolean; completion: "complete" | "truncated_by_provider" | "truncated_by_client";
     usage: Usage; attempts: number }>;
 }
 export interface PeerExchange {
@@ -412,6 +412,11 @@ export function sideThinkingOptions(model: Json, before: string, depth: Depth): 
     return { ok: true, value: { thinking, outputBudget, reasoningBudget: null,
       options: { maxTokens: outputBudget, ...(model.reasoning && thinking !== "off" ? { reasoningEffort: thinking } : {}) } } };
   }
+  // The Claude subscription lane runs Claude Code through the Agent SDK. It reads only
+  // `reasoning` (adaptive thinking + effort): no output ceiling and no payload hook reach
+  // the wire, so nativeQuestionTarget enforces the quick output cap on the stream.
+  if (model.api === "claude-sdk-oauth") return { ok: true, value: { thinking, outputBudget,
+    reasoningBudget: null, options: { reasoning: thinking === "off" ? undefined : thinking } } };
   if (model.api === "anthropic-messages") {
     if (depth === "quick" || before === "off" || !model.reasoning) {
       return { ok: true, value: { thinking: "off", outputBudget, reasoningBudget: null,
@@ -515,6 +520,59 @@ export function nativeQuestionTarget(options: {
       let responseStatus: number | null = null;
       let effectiveThinking = thinking.value.thinking;
       let policyRefused = false;
+      // claude-sdk-oauth: one logical request per run (lane-internal retries are not visible),
+      // a fresh one-shot Claude Code query (never the main's resident session), and a byte cap
+      // on the visible text - one token is at least one UTF-8 byte, so the cap bounds tokens.
+      const runSdkLane = async () => {
+        const stop = new AbortController();
+        const forward = () => stop.abort(signal.reason);
+        if (signal.aborted) forward(); else signal.addEventListener("abort", forward, { once: true });
+        const limit = depth === "quick" ? LIMITS.quick_output_tokens : Number.POSITIVE_INFINITY;
+        let text = "", bytes = 0, capped = false;
+        attempts = 1;
+        controls.wire_output_budget = null;
+        controls.output_cap = depth === "quick" ? "client_abort" : "native_default";
+        controls.lane_internal_retry = "possible";
+        if (depth === "deep") controls.native_default_output_budget = true;
+        try {
+          const stream = runtime!.modelRuntime.stream(snapshot.model, context, {
+            ...auth.options, ...thinking.value.options, headers, maxRetries: 0, signal: stop.signal,
+            toolChoice: "none", streamKind: undefined, sessionId: `${runtime!.sessionId}:peer:${randomUUID()}`,
+          });
+          for await (const event of stream as AsyncIterable<Json>) {
+            if (event.type !== "text_delta" || capped) continue;
+            const delta = String(event.delta ?? "");
+            if (bytes + Buffer.byteLength(delta) <= limit) { text += delta; bytes += Buffer.byteLength(delta); continue; }
+            for (const char of delta) {
+              if (bytes + Buffer.byteLength(char) > limit) break;
+              text += char; bytes += Buffer.byteLength(char);
+            }
+            capped = true;
+            stop.abort("output_cap");
+          }
+          const message = await stream.result();
+          signal.throwIfAborted();
+          if (!capped && (message.stopReason === "error" || message.stopReason === "aborted")) {
+            options.onFailure?.({ model: `${auth.model.provider}/${auth.model.id}`, api: auth.model.api,
+              status: responseStatus, error: String(message.errorMessage ?? message.stopReason)
+                .replace(/Bearer\s+\S+|sk-[A-Za-z0-9_-]+/g, "[redacted]") });
+            throw new Error("provider_failure");
+          }
+          return {
+            text: capped ? text : (message.content ?? []).filter((part: Json) => part.type === "text")
+              .map((part: Json) => part.text).join("\n"),
+            toolCalls: (message.content ?? []).some((part: Json) => part.type === "toolCall"),
+            completion: capped ? "truncated_by_client" as const
+              : message.stopReason === "length" ? "truncated_by_provider" as const : "complete" as const,
+            usage: { input: message.usage?.input ?? null, output: message.usage?.output ?? null,
+              reasoning: message.usage?.reasoning ?? message.usage?.reasoningTokens ?? null,
+              cache: message.usage?.cacheRead ?? null },
+            attempts,
+          };
+        } finally {
+          signal.removeEventListener("abort", forward);
+        }
+      };
       return { ok: true, value: {
         model: `${auth.model.provider}/${auth.model.id}`, route: `${auth.model.api}:${auth.model.baseUrl ?? "native"}`,
         controls, get thinking() { return effectiveThinking; }, reasoningBudget: thinking.value.reasoningBudget,
@@ -522,6 +580,7 @@ export function nativeQuestionTarget(options: {
         get attempts() { return attempts; },
         async run() {
           signal.throwIfAborted();
+          if (snapshot.model.api === "claude-sdk-oauth") return runSdkLane();
           const stream = runtime!.modelRuntime.stream(snapshot.model, context, {
             ...auth.options, ...thinking.value.options, headers, maxRetries: 0, signal,
             toolChoice: "none",
@@ -682,7 +741,7 @@ export function createRemoteQuestionHandlers(options: { capture: CapturedRuntime
     if (adapter && digest(adapter.binding) !== digest(call.target)) return refuse("stale_epoch");
     adapter ??= nativeQuestionTarget({
       capture: options.capture, binding: call.target,
-      validate: () => options.capture.read().ok ? { ok: true, value: undefined } : refuse("target_not_live"),
+      validate: () => options.capture.alive() ? { ok: true, value: undefined } : refuse("target_not_live"),
       subscribe: (listener) => options.captureStore.onRuntime((capture, event) => {
         if (capture === options.capture) listener(event === "closed" ? "target_not_live" : undefined);
       }),
@@ -1147,11 +1206,20 @@ export function createOwnedQuestions(options: {
   // Native handle publication is the launch event. Files deliver a one-use
   // capability only; bindRemote still authenticates the current owner, epoch,
   // original ManagedChildHandle, live process lineage and RPC branch before accepting it.
-  const discoverChildren = () => {
-    if (disposed || !native || !options.owner.read().ok) return Promise.resolve();
+  // This runs on every owner event, streaming deltas included: the liveness check must not
+  // clone and hash the conversation, and the owned listing (one stat per task record) is
+  // reused for a short window unless the task store itself changed.
+  const OWNED_LISTING_TTL_MS = 1000;
+  let ownedListing: { at: number; listed: ReturnType<EngineBridge["listOwned"]> } | undefined;
+  const discoverChildren = (storeChanged = false) => {
+    if (disposed || !native || !options.owner.alive()) return Promise.resolve();
     return transport().then((opened) => {
       if (!opened.ok || disposed) return;
-      const listed = options.bridge.listOwned();
+      const now = Date.now();
+      if (storeChanged || !ownedListing || now - ownedListing.at >= OWNED_LISTING_TTL_MS) {
+        ownedListing = { at: now, listed: options.bridge.listOwned() };
+      }
+      const listed = ownedListing.listed;
       if (!listed.ok) return;
       for (const snapshot of listed.value) {
         const ref = snapshot.identity.target_ref;
@@ -1187,7 +1255,7 @@ export function createOwnedQuestions(options: {
     }).catch(() => { /* Transport failure stays a typed refusal at the calling surface. */ });
   };
   if (native) fs.mkdirSync(bootstrapDirectory(options.context.agentDir), { recursive: true });
-  const stopNative = native?.onStoreMutation(discoverChildren);
+  const stopNative = native?.onStoreMutation(() => discoverChildren(true));
   const stopBootstrapCapture = options.capture.onRuntime((capture, event) => {
     if (capture === options.owner && event === "changed") discoverChildren();
   });

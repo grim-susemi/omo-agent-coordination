@@ -46,6 +46,12 @@ function createRuntimeCapture(options) {
     const capture = Object.freeze({
       runtime_instance_id: instance,
       runtime: () => disposed || closed ? undefined : ref.deref(),
+      alive() {
+        if (disposed || refusal)
+          return false;
+        const actual = ref.deref();
+        return !closed && !!actual && !actual._disposed && !!actual.model;
+      },
       read() {
         if (disposed)
           return { ok: false, reason: "stale_generation" };
@@ -97,7 +103,7 @@ function createRuntimeCapture(options) {
     if (disposed)
       return { ok: false, reason: "stale_generation" };
     const proto = namespace?.AgentSession?.prototype;
-    const reason = options.enabled === false || process.env.OMO_AGENT_COORDINATION === "0" ? "mode_disabled" : options.loaderNamespace.VERSION !== "2026.10.16" || namespace.VERSION !== "2026.10.16" ? "version" : !proto || typeof proto.bindExtensions !== "function" || typeof proto.dispose !== "function" ? "shape" : namespace.AgentSession !== options.loaderNamespace.AgentSession && namespace.AgentSession !== options.nativeNamespace?.()?.AgentSession ? "class_identity" : undefined;
+    const reason = options.enabled === false || process.env.OMO_AGENT_COORDINATION === "0" ? "mode_disabled" : options.loaderNamespace.VERSION !== "2026.10.19" || namespace.VERSION !== "2026.10.19" ? "version" : !proto || typeof proto.bindExtensions !== "function" || typeof proto.dispose !== "function" ? "shape" : namespace.AgentSession !== options.loaderNamespace.AgentSession && namespace.AgentSession !== options.nativeNamespace?.()?.AgentSession ? "class_identity" : undefined;
     if (reason) {
       refusal = reason;
       return { ok: false, reason: "unsupported_runtime", connection: reason };
@@ -520,7 +526,7 @@ function attachAutoReconcile(options) {
 // src/engine-bridge.ts
 var CARRIER = Symbol.for("omo.agent-coordination.native.v1");
 var BARREL = Symbol.for("omo.senpi-task.senpiBarrel");
-var BASELINE = "eb2db2c195edcf8e42dac8944535b7df85ad6e90fe1c806676573296799b2287";
+var BASELINE = "36d98c7ab3cc07349b60adc8bc7365a85e7573653ebab574d0114c2571d53dcd";
 var normalize = (id) => id.replace(/^senpi:/, "");
 var birthHooks = new WeakMap;
 function connectEngineBridge(options) {
@@ -2126,7 +2132,7 @@ async function connectRemoteRuntime(options) {
   return { ok: true, value: Object.freeze({
     binding: value.binding,
     root_ref: value.root_ref,
-    isCurrent: () => !wire.isClosed && options.capture.runtime() === runtime && options.capture.read().ok,
+    isCurrent: () => !wire.isClosed && options.capture.runtime() === runtime && options.capture.alive(),
     emit(event) {
       return wire.call({ kind: "event", value: event });
     },
@@ -2616,6 +2622,13 @@ function sideThinkingOptions(model, before, depth) {
       options: { maxTokens: outputBudget, ...model.reasoning && thinking !== "off" ? { reasoningEffort: thinking } : {} }
     } };
   }
+  if (model.api === "claude-sdk-oauth")
+    return { ok: true, value: {
+      thinking,
+      outputBudget,
+      reasoningBudget: null,
+      options: { reasoning: thinking === "off" ? undefined : thinking }
+    } };
   if (model.api === "anthropic-messages") {
     if (depth === "quick" || before === "off" || !model.reasoning) {
       return { ok: true, value: {
@@ -2746,6 +2759,78 @@ Answer this explicit peer question from this snapshot only. Do not continue the 
       let responseStatus = null;
       let effectiveThinking = thinking.value.thinking;
       let policyRefused = false;
+      const runSdkLane = async () => {
+        const stop = new AbortController;
+        const forward = () => stop.abort(signal.reason);
+        if (signal.aborted)
+          forward();
+        else
+          signal.addEventListener("abort", forward, { once: true });
+        const limit = depth === "quick" ? LIMITS.quick_output_tokens : Number.POSITIVE_INFINITY;
+        let text = "", bytes = 0, capped = false;
+        attempts = 1;
+        controls.wire_output_budget = null;
+        controls.output_cap = depth === "quick" ? "client_abort" : "native_default";
+        controls.lane_internal_retry = "possible";
+        if (depth === "deep")
+          controls.native_default_output_budget = true;
+        try {
+          const stream = runtime.modelRuntime.stream(snapshot.model, context, {
+            ...auth.options,
+            ...thinking.value.options,
+            headers,
+            maxRetries: 0,
+            signal: stop.signal,
+            toolChoice: "none",
+            streamKind: undefined,
+            sessionId: `${runtime.sessionId}:peer:${randomUUID5()}`
+          });
+          for await (const event of stream) {
+            if (event.type !== "text_delta" || capped)
+              continue;
+            const delta = String(event.delta ?? "");
+            if (bytes + Buffer.byteLength(delta) <= limit) {
+              text += delta;
+              bytes += Buffer.byteLength(delta);
+              continue;
+            }
+            for (const char of delta) {
+              if (bytes + Buffer.byteLength(char) > limit)
+                break;
+              text += char;
+              bytes += Buffer.byteLength(char);
+            }
+            capped = true;
+            stop.abort("output_cap");
+          }
+          const message = await stream.result();
+          signal.throwIfAborted();
+          if (!capped && (message.stopReason === "error" || message.stopReason === "aborted")) {
+            options.onFailure?.({
+              model: `${auth.model.provider}/${auth.model.id}`,
+              api: auth.model.api,
+              status: responseStatus,
+              error: String(message.errorMessage ?? message.stopReason).replace(/Bearer\s+\S+|sk-[A-Za-z0-9_-]+/g, "[redacted]")
+            });
+            throw new Error("provider_failure");
+          }
+          return {
+            text: capped ? text : (message.content ?? []).filter((part) => part.type === "text").map((part) => part.text).join(`
+`),
+            toolCalls: (message.content ?? []).some((part) => part.type === "toolCall"),
+            completion: capped ? "truncated_by_client" : message.stopReason === "length" ? "truncated_by_provider" : "complete",
+            usage: {
+              input: message.usage?.input ?? null,
+              output: message.usage?.output ?? null,
+              reasoning: message.usage?.reasoning ?? message.usage?.reasoningTokens ?? null,
+              cache: message.usage?.cacheRead ?? null
+            },
+            attempts
+          };
+        } finally {
+          signal.removeEventListener("abort", forward);
+        }
+      };
       return { ok: true, value: {
         model: `${auth.model.provider}/${auth.model.id}`,
         route: `${auth.model.api}:${auth.model.baseUrl ?? "native"}`,
@@ -2760,6 +2845,8 @@ Answer this explicit peer question from this snapshot only. Do not continue the 
         },
         async run() {
           signal.throwIfAborted();
+          if (snapshot.model.api === "claude-sdk-oauth")
+            return runSdkLane();
           const stream = runtime.modelRuntime.stream(snapshot.model, context, {
             ...auth.options,
             ...thinking.value.options,
@@ -2970,7 +3057,7 @@ function createRemoteQuestionHandlers(options) {
     adapter ??= nativeQuestionTarget({
       capture: options.capture,
       binding: call.target,
-      validate: () => options.capture.read().ok ? { ok: true, value: undefined } : refuse2("target_not_live"),
+      validate: () => options.capture.alive() ? { ok: true, value: undefined } : refuse2("target_not_live"),
       subscribe: (listener) => options.captureStore.onRuntime((capture, event) => {
         if (capture === options.capture)
           listener(event === "closed" ? "target_not_live" : undefined);
@@ -3547,13 +3634,19 @@ function createOwnedQuestions(options) {
     }
     return { ok: true, value: undefined };
   }
-  const discoverChildren = () => {
-    if (disposed || !native || !options.owner.read().ok)
+  const OWNED_LISTING_TTL_MS = 1000;
+  let ownedListing;
+  const discoverChildren = (storeChanged = false) => {
+    if (disposed || !native || !options.owner.alive())
       return Promise.resolve();
     return transport().then((opened) => {
       if (!opened.ok || disposed)
         return;
-      const listed = options.bridge.listOwned();
+      const now = Date.now();
+      if (storeChanged || !ownedListing || now - ownedListing.at >= OWNED_LISTING_TTL_MS) {
+        ownedListing = { at: now, listed: options.bridge.listOwned() };
+      }
+      const listed = ownedListing.listed;
       if (!listed.ok)
         return;
       for (const snapshot of listed.value) {
@@ -3594,7 +3687,7 @@ function createOwnedQuestions(options) {
   };
   if (native)
     fs2.mkdirSync(bootstrapDirectory(options.context.agentDir), { recursive: true });
-  const stopNative = native?.onStoreMutation(discoverChildren);
+  const stopNative = native?.onStoreMutation(() => discoverChildren(true));
   const stopBootstrapCapture = options.capture.onRuntime((capture, event) => {
     if (capture === options.owner && event === "changed")
       discoverChildren();
@@ -4039,6 +4132,16 @@ async function coordinationCapture(pi) {
   const projections = new Map;
   let disposed = false;
   let disposal;
+  const OWNED_LISTING_TTL_MS = 1000;
+  const ownedListings = new WeakMap;
+  const listOwnedRecent = (bridge) => {
+    const now = Date.now(), cached = ownedListings.get(bridge);
+    if (cached && now - cached.at < OWNED_LISTING_TTL_MS)
+      return cached.listed;
+    const listed = bridge.listOwned();
+    ownedListings.set(bridge, { at: now, listed });
+    return listed;
+  };
   const exposeTools = (captured) => {
     const runtime = captured.runtime();
     if (disposed || !runtime || typeof runtime.setActiveToolsByName !== "function")
@@ -4046,7 +4149,7 @@ async function coordinationCapture(pi) {
     if (bridges.has(runtime.sessionManager))
       return true;
     for (const bridge of active2) {
-      const listed = bridge.listOwned();
+      const listed = listOwnedRecent(bridge);
       if (!listed.ok)
         continue;
       for (const snapshot of listed.value) {

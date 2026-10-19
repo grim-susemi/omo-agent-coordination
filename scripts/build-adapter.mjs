@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { attempt, bundle, installedBundle } from "../qa/command.mjs";
 
-export const BASELINE = "eb2db2c195edcf8e42dac8944535b7df85ad6e90fe1c806676573296799b2287";
+export const BASELINE = "36d98c7ab3cc07349b60adc8bc7365a85e7573653ebab574d0114c2571d53dcd";
 export const CARRIER = "omo.agent-coordination.native.v1";
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const key = `globalThis[Symbol.for("${CARRIER}")]`;
@@ -48,13 +48,13 @@ export const DELTA = Object.freeze([
   },
   {
     seam: "R6: close the exact engine return expression",
-    before: "onStoreMutation:v.onMutation}}function E5(",
-    after: "onStoreMutation:v.onMutation})}function E5(",
+    before: "onStoreMutation:v.onMutation}}function P5(",
+    after: "onStoreMutation:v.onMutation})}function P5(",
   },
   {
     seam: "R7: createOutcomeTracker receives the original manager closures",
-    before: "function BH(e){let t=function(e){",
-    after: `function BH(e){${key}.outcomePorts(e);(${key}.replays??=new WeakMap).set(e.store,(...a)=>n(...a));let t=function(e){`,
+    before: "function ZH(e){let t=function(e){",
+    after: `function ZH(e){${key}.outcomePorts(e);(${key}.replays??=new WeakMap).set(e.store,(...a)=>n(...a));let t=function(e){`,
   },
   {
     seam: "R7: observe the native chosen terminal transition and preserve native failure cleanup",
@@ -78,13 +78,13 @@ export const DELTA = Object.freeze([
   },
   {
     seam: "R8: close native in-process turn factory capture",
-    before: "await lF(t))}},beginTurn:l}}async function dF(e)",
-    after: "await lF(t))}},beginTurn:l})}async function dF(e)",
+    before: "await hF(t))}},beginTurn:l}}async function mF(e)",
+    after: "await hF(t))}},beginTurn:l})}async function mF(e)",
   },
   {
     seam: "R6/R8: preserve runtime ownership through the native managed-handle conversion",
-    before: "function hW(e){return{task_id:e.task_id,kind:\"in-process\",sessionId:e.sessionId,pid:void 0,effectiveModel:()=>e.effectiveModel(),steer:t=>e.steer(t),followUp:t=>e.followUp(t),abort:()=>e.abort(),subscribe:t=>e.subscribe(t),waitForOutcome:()=>e.waitForIdle(),lastAssistantText:()=>e.lastAssistantText(),dispose:async()=>{await e.dispose()}}}",
-    after: `function hW(e){let t={task_id:e.task_id,kind:"in-process",sessionId:e.sessionId,pid:void 0,effectiveModel:()=>e.effectiveModel(),steer:t=>e.steer(t),followUp:t=>e.followUp(t),abort:()=>e.abort(),subscribe:t=>e.subscribe(t),waitForOutcome:()=>e.waitForIdle(),lastAssistantText:()=>e.lastAssistantText(),dispose:async()=>{await e.dispose()}};let n=${key}.runtimeOwners.get(e);return void 0!==n&&${key}.runtimeOwners.set(t,n),t}`,
+    before: "function kW(e){return{task_id:e.task_id,kind:\"in-process\",sessionId:e.sessionId,pid:void 0,effectiveModel:()=>e.effectiveModel(),steer:t=>e.steer(t),followUp:t=>e.followUp(t),abort:()=>e.abort(),subscribe:t=>e.subscribe(t),waitForOutcome:()=>e.waitForIdle(),lastAssistantText:()=>e.lastAssistantText(),dispose:async()=>{await e.dispose()}}}",
+    after: `function kW(e){let t={task_id:e.task_id,kind:"in-process",sessionId:e.sessionId,pid:void 0,effectiveModel:()=>e.effectiveModel(),steer:t=>e.steer(t),followUp:t=>e.followUp(t),abort:()=>e.abort(),subscribe:t=>e.subscribe(t),waitForOutcome:()=>e.waitForIdle(),lastAssistantText:()=>e.lastAssistantText(),dispose:async()=>{await e.dispose()}};let n=${key}.runtimeOwners.get(e);return void 0!==n&&${key}.runtimeOwners.set(t,n),t}`,
   },
   {
     seam: "R8: read session identity through the original RPC client, never launcher PID metadata",
@@ -143,12 +143,12 @@ export function buildAdapter({ input = bundle, output }) {
     removal: { backup: output + ".baseline", expected_sha256: BASELINE, hash_guarded: true },
     mode_absent: "Weak discovery only; no session/handle/SDK copy, mutation, or native outcome wrapping.",
     runtime_ownership: {
-      capture: "R8 aF(task_id, session, completion): exact session parameter, keyed by the returned runner handle",
-      propagation: "R6/R8 hW(runnerHandle): the same ownership entry, keyed by the returned ManagedChildHandle",
+      capture: "R8 native turn factory(task_id, session, completion): exact session parameter, keyed by the returned runner handle",
+      propagation: "R6/R8 kW(runnerHandle): the same ownership entry, keyed by the returned ManagedChildHandle",
       validation: "Same live native manager/outcome handle and current task/epoch; runtime object identity, never constructor or session-ID membership",
       references: "WeakMap handle keys and WeakRef AgentSession values; native lifetime remains unchanged",
     },
-    source: "omo-ai 5.1.35 installed bundle; original semantic references d7e224e478a4a77dba0d2104c336fdc72ad301e3 (R6/R7/R8/R13)",
+    source: "omo-ai 5.1.38 installed bundle; original semantic references d7e224e478a4a77dba0d2104c336fdc72ad301e3 (R6/R7/R8/R13)",
     license: "Installed plugin LICENSE and NOTICE apply to the input; only this small delta is product source.",
   };
   fs.mkdirSync(path.dirname(output), { recursive: true });
