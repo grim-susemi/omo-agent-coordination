@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { BASELINE, buildAdapter } from "./build-adapter.mjs";
+import { BASELINE, BASELINES, buildAdapter } from "./build-adapter.mjs";
 import { attempt, product } from "../qa/command.mjs";
 
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -49,6 +49,12 @@ function tree(directory) {
 function expectHash(file, hash, reason) {
   if (!fs.existsSync(file) || !fs.statSync(file).isFile() || digest(fs.readFileSync(file)) !== hash) throw new Error(reason);
 }
+function expectBaseline(file, reason) {
+  if (!fs.existsSync(file) || !fs.statSync(file).isFile()) throw new Error(reason);
+  const hash = digest(fs.readFileSync(file));
+  if (!BASELINES[hash]) throw new Error(reason);
+  return hash;
+}
 function installedPlan(paths) {
   const receiptPath = safe(paths.root, path.join(paths.state, "receipt.json"));
   const seal = safe(paths.root, path.join(paths.state, "receipt.sha256"));
@@ -68,7 +74,7 @@ function installedPlan(paths) {
     const target = safe(paths.root, receipt.adapter.target);
     const backup = safe(paths.root, path.join(paths.state, "adapter", "omo-task.js.baseline"));
     expectHash(target, receipt.adapter.candidate_sha256, "ADAPTER_DRIFT_REFUSED");
-    expectHash(backup, BASELINE, "ADAPTER_BACKUP_REFUSED");
+    expectHash(backup, receipt.adapter.baseline_sha256 ?? BASELINE, "ADAPTER_BACKUP_REFUSED");
     const manifest = safe(paths.root, path.join(paths.state, "adapter", "omo-task.js.manifest.json"));
     expectHash(manifest, receipt.adapter.manifest_sha256, "ADAPTER_MANIFEST_REFUSED");
   }
@@ -85,7 +91,7 @@ export async function install({ agentDir, action = "install", dryRun = false, ad
   if (action !== "install") {
     const receipt = installedPlan(paths);
     const result = { action, dry_run: dryRun, agent_dir: paths.root, package_dir: paths.directory,
-      restored_adapter_sha256: receipt.adapter ? BASELINE : null, restored_settings_sha256: receipt.settings_before_sha256 };
+      restored_adapter_sha256: receipt.adapter ? receipt.adapter.baseline_sha256 ?? BASELINE : null, restored_settings_sha256: receipt.settings_before_sha256 };
     if (dryRun) return result;
     // All input bytes are read before destructive work, including settings that
     // originally did not exist. The receipt stays until restoration completes.
@@ -105,14 +111,14 @@ export async function install({ agentDir, action = "install", dryRun = false, ad
   if (!settings || typeof settings !== "object" || Array.isArray(settings) ||
       settings.packages !== undefined && !Array.isArray(settings.packages)) throw new Error("SETTINGS_SHAPE_REFUSED");
   const target = adapterTarget ? safe(paths.root, path.resolve(adapterTarget)) : null;
-  if (target) expectHash(target, BASELINE, "BUNDLE_DRIFT_REFUSED");
+  const baseline = target ? expectBaseline(target, "BUNDLE_DRIFT_REFUSED") : null;
   const after = json({ ...settings, packages: [...(settings.packages ?? []), paths.directory] });
   const manifest = { name: packageName, version: "0.0.0", type: "module", private: true,
     peerDependencies: { "@code-yeongyu/senpi": "*" },
     pi: { extensions: ["./dist/extension.js"] },
     exports: { "./api": { types: "./src/public-api.ts", import: "./dist/public-api.js" } } };
   const result = { action, dry_run: dryRun, agent_dir: paths.root, package_dir: paths.directory,
-    pi: manifest.pi, adapter_target: target, adapter_baseline_sha256: target ? BASELINE : null,
+    pi: manifest.pi, adapter_target: target, adapter_baseline_sha256: baseline,
     settings_before_sha256: before ? digest(before) : null, settings_after_sha256: digest(after) };
   if (dryRun) return result;
   if (typeof Bun === "undefined") throw new Error("BUN_REQUIRED");
@@ -133,7 +139,7 @@ export async function install({ agentDir, action = "install", dryRun = false, ad
     const built = buildAdapter({ input: target, output: path.join(paths.state, "adapter", "omo-task.js") });
     // The real loader resolves SDK imports; no dependency copy/junction is shipped.
     fs.unlinkSync(path.join(paths.state, "adapter", "node_modules"));
-    adapter = { target, candidate_sha256: built.candidate_sha256,
+    adapter = { target, candidate_sha256: built.candidate_sha256, baseline_sha256: baseline,
       manifest_sha256: digest(fs.readFileSync(built.output + ".manifest.json")) };
   }
   for (const [file, content] of bytes) {
@@ -152,7 +158,7 @@ export async function install({ agentDir, action = "install", dryRun = false, ad
   if (before) expectHash(paths.settings, digest(before), "SETTINGS_CHANGED_DURING_BUILD");
   else if (fs.existsSync(paths.settings)) throw new Error("SETTINGS_CHANGED_DURING_BUILD");
   if (target) {
-    expectHash(target, BASELINE, "BUNDLE_DRIFT_REFUSED");
+    if (expectBaseline(target, "BUNDLE_DRIFT_REFUSED") !== baseline) throw new Error("BUNDLE_DRIFT_REFUSED");
     fs.copyFileSync(path.join(paths.state, "adapter", "omo-task.js"), target);
   }
   fs.writeFileSync(paths.settings, after);

@@ -6,7 +6,10 @@ import type { NativeReplayCarrier, SettlementReceipt, SettlementRecord } from ".
 
 const CARRIER = Symbol.for("omo.agent-coordination.native.v1");
 const BARREL = Symbol.for("omo.senpi-task.senpiBarrel");
-const BASELINE = "36d98c7ab3cc07349b60adc8bc7365a85e7573653ebab574d0114c2571d53dcd";
+const BASELINES = new Set([
+  "36d98c7ab3cc07349b60adc8bc7365a85e7573653ebab574d0114c2571d53dcd",
+  "d41bc807b6f91768db84b7f8f76092107aebf9934888cc749174d88a1c00ac6b",
+]);
 const normalize = (id: string) => id.replace(/^senpi:/, "");
 type RefusalReason = "unsupported_runtime" | "connection_failed" | "scope_denied" |
   "invalid_target" | "stale_epoch" | "stale_generation" | "runtime_mismatch" | "repair_not_enabled";
@@ -169,7 +172,7 @@ export function connectEngineBridge(options: {
   if (options.enabled === false || process.env.OMO_AGENT_COORDINATION === "0") {
     return { ok: false, reason: "unsupported_runtime", connection: "mode_disabled" };
   }
-  if (!carrier || carrier.version !== 2 || carrier.baseline_sha256 !== BASELINE) {
+  if (!carrier || carrier.version !== 2 || !BASELINES.has(carrier.baseline_sha256)) {
     return { ok: false, reason: "unsupported_runtime", connection: "native adapter carrier" };
   }
   const manager = options.context.sessionManager;

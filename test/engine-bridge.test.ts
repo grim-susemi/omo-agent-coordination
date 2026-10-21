@@ -1,5 +1,29 @@
 import { expect, test } from "bun:test";
 import { runBridgeCase } from "../qa/cases/native-bridge.ts";
+import { connectEngineBridge } from "../src/engine-bridge.ts";
+import { BASELINE, BASELINE_5140 } from "../scripts/build-adapter.mjs";
+
+test("both pinned native adapter baselines are admitted; any other carrier is refused", () => {
+  const root = globalThis as unknown as Record<symbol, unknown>;
+  const carrier = Symbol.for("omo.agent-coordination.native.v1");
+  const saved = root[carrier];
+  const manager = {};
+  const probe = () => connectEngineBridge({
+    context: { sessionManager: manager as never }, generation: 0,
+    loaderNamespace: { AgentSession: class {} } as never,
+  });
+  try {
+    for (const baseline of [BASELINE, BASELINE_5140]) {
+      root[carrier] = { version: 2, baseline_sha256: baseline, contexts: new WeakMap() };
+      // An admitted carrier proceeds to the live-engine scope check instead of stopping at the carrier.
+      expect(probe()).toEqual({ ok: false, reason: "scope_denied", connection: "native session_start binding" });
+    }
+    root[carrier] = { version: 2, baseline_sha256: "0".repeat(64), contexts: new WeakMap() };
+    expect(probe()).toEqual({ ok: false, reason: "unsupported_runtime", connection: "native adapter carrier" });
+  } finally {
+    if (saved === undefined) delete root[carrier]; else root[carrier] = saved;
+  }
+});
 
 test("the actual registered native task binds owner, epoch, handle, runtime, and settlement receipts", async () => {
   const result = await runBridgeCase("engine-bridge");

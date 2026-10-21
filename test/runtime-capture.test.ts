@@ -96,6 +96,31 @@ test("a native process child loads the same single ESM extension and captures it
   expect(result.native_worker_completed).toBe(true);
 }, 120_000);
 
+test("the 2026.10.19-2 build is admitted by the same capture gate", async () => {
+  const Session = class {
+    sessionId = crypto.randomUUID();
+    sessionManager = { getSessionId: () => this.sessionId, getLeafId: () => null };
+    model = { provider: "capture", id: "offline" };
+    modelRuntime = {};
+    systemPrompt = "";
+    messages: unknown[] = [];
+    activitySnapshot = { isStreaming: false, isBashRunning: false, isCompacting: false,
+      hasSessionWork: false, hasActiveWakeSource: false };
+    async bindExtensions() {}
+    dispose() {}
+    subscribe() { return () => {}; }
+  };
+  const capture = createRuntimeCapture({
+    loaderNamespace: { AgentSession: Session, VERSION: "2026.10.19-2" }, generation: 1,
+  });
+  try {
+    expect(capture.status).toEqual({ ok: true, value: undefined });
+    const session = new Session();
+    await session.bindExtensions();
+    expect(capture.forRuntime(session).ok).toBe(true);
+  } finally { capture.dispose(); }
+});
+
 test("version, shape, and class mismatch refuse only capture and preserve native worker completion", async () => {
   const result = await runCaptureCase("capture-unsupported");
   expect(result.passed).toBe(true);

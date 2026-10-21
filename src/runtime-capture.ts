@@ -55,6 +55,11 @@ interface Hook {
   listeners: Map<symbol, { bound(runtime: LiveSession): void; closed(runtime: LiveSession): void }>;
 }
 const HOOKS = Symbol.for("omo.agent-coordination.capture-hooks.v1");
+// Verified compatible: the AgentSession surfaces captured below (class, sessionId,
+// sessionManager.getLeafId, subscribe, model, modelRuntime, systemPrompt, messages,
+// activitySnapshot, _disposed, bindExtensions, dispose) are unchanged between these builds.
+const SUPPORTED_SENPI = new Set(["2026.10.19", "2026.10.19-2"]);
+const supportedVersion = (version: string | undefined) => version !== undefined && SUPPORTED_SENPI.has(version);
 const global = globalThis as unknown as Record<symbol, unknown>;
 const hooks = (global[HOOKS] ??= new WeakMap<Prototype, Hook>()) as WeakMap<Prototype, Hook>;
 
@@ -149,7 +154,7 @@ export function createRuntimeCapture(options: {
     if (disposed) return { ok: false, reason: "stale_generation" };
     const proto = namespace?.AgentSession?.prototype as unknown as Prototype | undefined;
     const reason = options.enabled === false || process.env.OMO_AGENT_COORDINATION === "0" ? "mode_disabled" :
-      options.loaderNamespace.VERSION !== "2026.10.19" || namespace.VERSION !== "2026.10.19" ? "version" :
+      !supportedVersion(options.loaderNamespace.VERSION) || !supportedVersion(namespace.VERSION) ? "version" :
       !proto || typeof proto.bindExtensions !== "function" || typeof proto.dispose !== "function" ? "shape" :
       namespace.AgentSession !== options.loaderNamespace.AgentSession &&
         namespace.AgentSession !== options.nativeNamespace?.()?.AgentSession ? "class_identity" : undefined;

@@ -4,6 +4,8 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 // src/runtime-capture.ts
 import { createHash, randomUUID } from "node:crypto";
 var HOOKS = Symbol.for("omo.agent-coordination.capture-hooks.v1");
+var SUPPORTED_SENPI = new Set(["2026.10.19", "2026.10.19-2"]);
+var supportedVersion = (version) => version !== undefined && SUPPORTED_SENPI.has(version);
 var global = globalThis;
 var hooks = global[HOOKS] ??= new WeakMap;
 function createRuntimeCapture(options) {
@@ -103,7 +105,7 @@ function createRuntimeCapture(options) {
     if (disposed)
       return { ok: false, reason: "stale_generation" };
     const proto = namespace?.AgentSession?.prototype;
-    const reason = options.enabled === false || process.env.OMO_AGENT_COORDINATION === "0" ? "mode_disabled" : options.loaderNamespace.VERSION !== "2026.10.19" || namespace.VERSION !== "2026.10.19" ? "version" : !proto || typeof proto.bindExtensions !== "function" || typeof proto.dispose !== "function" ? "shape" : namespace.AgentSession !== options.loaderNamespace.AgentSession && namespace.AgentSession !== options.nativeNamespace?.()?.AgentSession ? "class_identity" : undefined;
+    const reason = options.enabled === false || process.env.OMO_AGENT_COORDINATION === "0" ? "mode_disabled" : !supportedVersion(options.loaderNamespace.VERSION) || !supportedVersion(namespace.VERSION) ? "version" : !proto || typeof proto.bindExtensions !== "function" || typeof proto.dispose !== "function" ? "shape" : namespace.AgentSession !== options.loaderNamespace.AgentSession && namespace.AgentSession !== options.nativeNamespace?.()?.AgentSession ? "class_identity" : undefined;
     if (reason) {
       refusal = reason;
       return { ok: false, reason: "unsupported_runtime", connection: reason };
@@ -526,7 +528,10 @@ function attachAutoReconcile(options) {
 // src/engine-bridge.ts
 var CARRIER = Symbol.for("omo.agent-coordination.native.v1");
 var BARREL = Symbol.for("omo.senpi-task.senpiBarrel");
-var BASELINE = "36d98c7ab3cc07349b60adc8bc7365a85e7573653ebab574d0114c2571d53dcd";
+var BASELINES = new Set([
+  "36d98c7ab3cc07349b60adc8bc7365a85e7573653ebab574d0114c2571d53dcd",
+  "d41bc807b6f91768db84b7f8f76092107aebf9934888cc749174d88a1c00ac6b"
+]);
 var normalize = (id) => id.replace(/^senpi:/, "");
 var birthHooks = new WeakMap;
 function connectEngineBridge(options) {
@@ -535,7 +540,7 @@ function connectEngineBridge(options) {
   if (options.enabled === false || process.env.OMO_AGENT_COORDINATION === "0") {
     return { ok: false, reason: "unsupported_runtime", connection: "mode_disabled" };
   }
-  if (!carrier || carrier.version !== 2 || carrier.baseline_sha256 !== BASELINE) {
+  if (!carrier || carrier.version !== 2 || !BASELINES.has(carrier.baseline_sha256)) {
     return { ok: false, reason: "unsupported_runtime", connection: "native adapter carrier" };
   }
   const manager = options.context.sessionManager;

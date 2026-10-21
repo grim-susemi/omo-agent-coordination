@@ -35,9 +35,13 @@ pass that copy explicitly:
 bun scripts/install.mjs install --agent-dir "<attempt>/task-9/demo/agent" --adapter-target "<attempt>/task-9/demo/agent/native/omo-task.js"
 ```
 
-The target must be inside agentDir and match SHA-256
+The target must be inside agentDir and match one of the pinned baseline digests
+in `scripts/build-adapter.mjs`: 5.1.38
 `36d98c7ab3cc07349b60adc8bc7365a85e7573653ebab574d0114c2571d53dcd`
-(omo-ai 5.1.38, 1,100,451 B).
+(1,100,451 B) or 5.1.40
+`d41bc807b6f91768db84b7f8f76092107aebf9934888cc749174d88a1c00ac6b`
+(1,105,299 B). Unknown bundle bytes are refused before any output is written.
+Each baseline has its own anchor table and SDK pin file.
 The builder also verifies pinned AgentSession SDK bytes and unique structural
 anchors. Its manifest records each exact before/after anchor, bootstrap,
 baseline/candidate hashes and why the native owner-engine connection is required.
@@ -50,6 +54,21 @@ the subscribing mode. It is not a second scheduler or a vendored engine.
 Source version: omo-ai 5.1.38, original semantic references
 `d7e224e478a4a77dba0d2104c336fdc72ad301e3`. See scripts/build-adapter.mjs and
 the generated manifest for the complete delta.
+
+## 5.1.40 / Senpi 2026.10.19-2 adapter (applied 2026-10-22)
+
+Branch `port/omo-5.1.40` builds the adapter from the stock 5.1.40 bundle
+`d41bc807...` with a separate twelve-anchor table. The rebuild of the preserved
+5.1.38 bundle is still byte-identical to the recorded candidate
+`2b559bb11f0285072722cffbb7f322756c81aec867f6fb4a683278f075d7f783`.
+On 2026-10-22 the stable-500 lane switched to this pair. `dist/extension.js`
+(`6035ef1a...`) and the plain adapter `c2269e28...` with the plan-review-unlock
+overlay (`0dd146b9...`) were copied over the package and both `omo-task.js` copies
+by a hash-guarded script that keeps the stock backups.
+The 5.1.40 plain adapter and its plan-review-unlock overlay, the senpi 19 vs 19-2
+comparison, the test log and the guarded live apply plan are recorded outside the
+repository in
+`.omo/evidence/omo-maintenance-20261021/m5/coordination/REPORT.md`.
 
 ## Live adapter installation (5.1.38 candidate, NOT applied)
 
