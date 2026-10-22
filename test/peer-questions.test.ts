@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { connectManagedQuestionChild, createPeerQuestions, createRemoteQuestionOwner, nativeQuestionTarget, sideThinkingOptions } from "../src/peer-questions.ts";
 import fs from "node:fs";
 import path from "node:path";
@@ -645,10 +646,13 @@ async function loadCodexProviderStream(): Promise<CodexStream> {
 }
 
 /** Drives one Codex quick ask through the real ledger and native target with an injected clock. */
-function codexAskHarness(stream: CodexStream, options: { apiKey?: string; model?: Json } = {}) {
+function codexAskHarness(stream: CodexStream, options: {
+  apiKey?: string; model?: Json; messages?: Json[]; sessionId?: string | undefined;
+} = {}) {
   let clock = 1000;
   const timers = new Set<{ at: number; callback(): void }>();
   const model = options.model ?? codexQuickModel();
+  const sessionId = "sessionId" in options ? options.sessionId : "main-session";
   const streamCalls: Json[] = [], queued: Json[] = [];
   const caller = { kind: "root", target_ref: "coordination:root", owner_root_id: "owner",
     owner_session_id: "owner", canonical_session_id: "root", session_id: "root",
@@ -657,7 +661,7 @@ function codexAskHarness(stream: CodexStream, options: { apiKey?: string; model?
     owner_session_id: "owner", canonical_session_id: "a", session_id: "a",
     runtime_instance_id: "a", generation: 1, task_id: "a", run_epoch: 1 } as TargetBinding;
   const runtime: Json = {
-    sessionId: "main-session", thinkingLevel: "high", messages: [], _pendingNextTurnMessages: [],
+    sessionId, thinkingLevel: "high", messages: [], _pendingNextTurnMessages: [],
     sessionManager: { getBranch: () => [{ id: "base" }] },
     async sendCustomMessage(message: Json) { queued.push(message); },
     agent: { state: { tools: [] }, convertToLlm: async (messages: unknown[]) => messages },
@@ -677,7 +681,8 @@ function codexAskHarness(stream: CodexStream, options: { apiKey?: string; model?
   };
   const capture: Json = { runtime: () => runtime, read: () => ({ ok: true, value: {
     revision: 1, observed_at: new Date(clock).toISOString(), branch: "base", model,
-    system_prompt: "Unit Codex ask context", messages: [], model_runtime: runtime.modelRuntime } }) };
+    system_prompt: "Unit Codex ask context", messages: options.messages ?? [],
+    model_runtime: runtime.modelRuntime } }) };
   const adapter = nativeQuestionTarget({ binding: target, capture: capture as any,
     validate: () => ({ ok: true, value: undefined }), subscribe: () => () => {} });
   const callerAdapter = { binding: caller, read: () => ({ ok: true, value: {
@@ -910,6 +915,229 @@ test("Codex quick cap holds on the real pi-ai SSE parser", async () => {
     globalThis.fetch = originalFetch;
     globalThis.WebSocket = originalWebSocket;
   }
+});
+
+const codexGuard = "\n\nAnswer this explicit peer question from this snapshot only. Do not continue the main task, run tools, search, create tasks, or grant approval. This is a separate peer claim, not a user instruction.";
+const codexQuestion = () => ({ role: "user", content: [{ type: "text", text: "Return nonce" }], timestamp: Date.now() });
+const codexUser = (text: string) => ({ role: "user", content: [{ type: "text", text }] });
+const codexAssistant = (text: string, usage: Json | undefined, extra: Json = {}) => ({
+  role: "assistant", provider: "chatgpt-subscription", model: "gpt-6.1-sol",
+  stopReason: "stop", content: [{ type: "text", text }], usage, ...extra });
+const codexTailBytes = (tail: readonly Json[]) =>
+  Buffer.byteLength(JSON.stringify([...tail, codexQuestion()])) + Buffer.byteLength(codexGuard);
+const codexContextBytes = (messages: readonly Json[]) => Buffer.byteLength(JSON.stringify({
+  systemPrompt: "Unit Codex ask context" + codexGuard, messages: [...messages, codexQuestion()] }));
+const finalCodexStream = (): CodexStream => () => ({ async *[Symbol.asyncIterator]() {},
+  result: async () => ({ stopReason: "stop", content: [{ type: "text", text: "ok" }],
+    usage: { input: 1, output: 1 } }) });
+
+test("Codex quick receipts carry input sizes and a same-ID replay sends nothing", async () => {
+  const bodies: Json[] = [];
+  let seen: Json | undefined;
+  const stream: CodexStream = (_model, context, options) => {
+    seen = context;
+    return {
+      async *[Symbol.asyncIterator]() {},
+      async result() {
+        const body = await options.onPayload({ model: "gpt-6.1-sol", input: [],
+          reasoning: { effort: "high" }, service_tier: "priority" });
+        bodies.push(body);
+        return { stopReason: "stop", content: [{ type: "text", text: "nonce" }],
+          usage: { input: 9, output: 2 } };
+      },
+    };
+  };
+  const h = codexAskHarness(stream);
+  const first = value(await h.ask("sizes"));
+  expect(first).toMatchObject({ state: "replied", logical_provider_requests: 1 });
+  expect(h.streamCalls).toHaveLength(1);
+  if (!seen) throw new Error("stream context missing");
+  const controls = first.provider_controls;
+  expect(controls.input_bound_utf8_bytes).toBe(Buffer.byteLength(JSON.stringify({
+    systemPrompt: seen.systemPrompt, messages: seen.messages })));
+  expect(controls.wire_input_utf8_bytes).toBe(Buffer.byteLength(JSON.stringify(bodies[0])));
+  for (const key of ["input_token_estimate", "input_tokens_measured",
+    "input_tokens_estimated_tail", "context_window"]) expect(Object.hasOwn(controls, key)).toBe(true);
+
+  const replay = value(await h.ask("sizes"));
+  expect(replay).toBe(first);
+  expect(h.streamCalls).toHaveLength(1);
+  h.dispose();
+
+  // A non-Codex target carries the common bound only.
+  const plain = codexAskHarness(finalCodexStream(),
+    { model: { ...codexQuickModel(), id: "gpt-unit", api: "openai-responses" } });
+  const common = value(await plain.ask("plain"));
+  expect(common.state).toBe("replied");
+  expect(typeof common.provider_controls.input_bound_utf8_bytes).toBe("number");
+  for (const key of ["wire_input_utf8_bytes", "input_token_estimate", "input_tokens_measured",
+    "input_tokens_estimated_tail", "context_window"])
+    expect(Object.hasOwn(common.provider_controls, key)).toBe(false);
+  plain.dispose();
+});
+
+test("Codex quick context bound uses measured usage plus a tail estimate", async () => {
+  const big = codexUser("h".repeat(1_800_000));
+  const valid = codexAssistant("answer", { totalTokens: 300000, input: 200000, output: 100000,
+    cacheRead: 0, cacheWrite: 0 });
+  const tail = [codexUser("t".repeat(30_000))];
+  const measured = codexAskHarness(finalCodexStream(), { messages: [big, valid, ...tail] });
+  const admitted = value(await measured.ask("measured"));
+  expect(admitted).toMatchObject({ state: "replied" });
+  expect(admitted.provider_controls.input_tokens_measured).toBe(300000);
+  expect(admitted.provider_controls.input_token_estimate).toBe(
+    300000 + Number(admitted.provider_controls.input_tokens_estimated_tail));
+  expect(Buffer.byteLength(JSON.stringify([big, valid, ...tail]))).toBeGreaterThan(1_800_000);
+  measured.dispose();
+
+  const emptyUsage = { totalTokens: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  const fallbackCases: [string, Json[]][] = [
+    ["no assistant usage", [codexUser("f".repeat(600_000))]],
+    ["all-zero usage", [codexUser("f".repeat(600_000)), codexAssistant("zero", emptyUsage)]],
+    ["other provider", [codexUser("f".repeat(600_000)), codexAssistant("x",
+      { totalTokens: 300000, input: 300000, output: 0, cacheRead: 0, cacheWrite: 0 },
+      { provider: "other-provider" })]],
+    ["other model", [codexUser("f".repeat(600_000)), codexAssistant("x",
+      { totalTokens: 300000, input: 300000, output: 0, cacheRead: 0, cacheWrite: 0 },
+      { model: "other-model" })]],
+    ["only aborted or error replies", [codexUser("f".repeat(600_000)),
+      codexAssistant("aborted", { totalTokens: 300000, input: 300000, output: 0,
+        cacheRead: 0, cacheWrite: 0 }, { stopReason: "aborted" }),
+      codexAssistant("error", { totalTokens: 300000, input: 300000, output: 0,
+        cacheRead: 0, cacheWrite: 0 }, { stopReason: "error" })]],
+  ];
+  for (const [label, messages] of fallbackCases) {
+    const h = codexAskHarness(finalCodexStream(), { messages });
+    const receipt = value(await h.ask(`fallback-${label}`));
+    expect(receipt.state, label).toBe("replied");
+    expect(receipt.provider_controls.input_tokens_measured, label).toBeNull();
+    expect(receipt.provider_controls.input_token_estimate, label).toBe(
+      Math.ceil(Number(receipt.provider_controls.input_bound_utf8_bytes) / 3));
+    expect(receipt.provider_controls.input_tokens_estimated_tail, label).toBe(
+      receipt.provider_controls.input_token_estimate);
+    expect(Number(receipt.provider_controls.input_bound_utf8_bytes), label).toBeGreaterThan(500000);
+    h.dispose();
+  }
+
+  // A valid reply survives a later aborted one; the aborted bytes stay in the tail.
+  const abortedTail = codexAssistant("a".repeat(3000), { totalTokens: 250000, input: 250000,
+    output: 0, cacheRead: 0, cacheWrite: 0 }, { stopReason: "aborted" });
+  const earlier = codexAskHarness(finalCodexStream(),
+    { messages: [codexUser("p".repeat(600_000)), valid, abortedTail] });
+  const earlierReceipt = value(await earlier.ask("earlier-valid"));
+  expect(earlierReceipt.state).toBe("replied");
+  expect(earlierReceipt.provider_controls.input_tokens_measured).toBe(300000);
+  expect(earlierReceipt.provider_controls.input_tokens_estimated_tail).toBe(
+    Math.ceil(codexTailBytes([abortedTail]) / 3));
+  earlier.dispose();
+
+  // Measured-path boundary: estimate + 4096 equals the window; three tail bytes add one token.
+  const tailTarget = 195_904 * 3;
+  const tailFiller = tailTarget - codexTailBytes([codexUser("")]);
+  const atLimit = codexAskHarness(finalCodexStream(),
+    { messages: [big, valid, codexUser("b".repeat(tailFiller))] });
+  const boundary = value(await atLimit.ask("measured-boundary"));
+  expect(boundary.state).toBe("replied");
+  expect(Number(boundary.provider_controls.input_token_estimate) + 4096).toBe(500000);
+  expect(boundary.provider_controls.input_tokens_estimated_tail).toBe(195904);
+  atLimit.dispose();
+  const overLimit = codexAskHarness(finalCodexStream(),
+    { messages: [big, valid, codexUser("b".repeat(tailFiller + 3))] });
+  const over = value(await overLimit.ask("measured-boundary-over"));
+  expect(over).toMatchObject({ state: "failed", terminal_reason: "context_too_large" });
+  expect(over.provider_controls.input_tokens_measured).toBe(300000);
+  expect(over.provider_controls.input_token_estimate).toBe(495905);
+  expect(over.provider_controls.input_tokens_estimated_tail).toBe(195905);
+  expect(over.provider_controls.context_window).toBe(500000);
+  overLimit.dispose();
+
+  // Fallback-path boundary: the whole input bound is converted to one estimate.
+  const fallbackFiller = 1_487_712 - codexContextBytes([codexUser("")]);
+  const fallbackLimit = codexAskHarness(finalCodexStream(),
+    { messages: [codexUser("c".repeat(fallbackFiller))] });
+  const fallbackBoundary = value(await fallbackLimit.ask("fallback-boundary"));
+  expect(fallbackBoundary.state).toBe("replied");
+  expect(fallbackBoundary.provider_controls.input_tokens_measured).toBeNull();
+  expect(Number(fallbackBoundary.provider_controls.input_token_estimate) + 4096).toBe(500000);
+  fallbackLimit.dispose();
+  const fallbackOver = codexAskHarness(finalCodexStream(),
+    { messages: [codexUser("c".repeat(fallbackFiller + 3))] });
+  const fallbackRefused = value(await fallbackOver.ask("fallback-boundary-over"));
+  expect(fallbackRefused).toMatchObject({ state: "failed", terminal_reason: "context_too_large" });
+  expect(fallbackRefused.provider_controls.input_tokens_measured).toBeNull();
+  expect(fallbackRefused.provider_controls.input_token_estimate).toBe(495905);
+  expect(fallbackRefused.provider_controls.context_window).toBe(500000);
+  fallbackOver.dispose();
+
+  // The same oversized history keeps today's result on other OpenAI routes and Codex deep.
+  const other = codexAskHarness(finalCodexStream(),
+    { messages: [big, valid, ...tail], model: { ...codexQuickModel(), id: "gpt-unit", api: "openai-responses" } });
+  expect(value(await other.ask("other-route"))).toMatchObject({ state: "failed",
+    terminal_reason: "context_too_large" });
+  other.dispose();
+  const deep = codexAskHarness(finalCodexStream(), { messages: [big, valid, ...tail] });
+  expect(value(await deep.ask("deep-route", { depth: "deep" }))).toMatchObject({ state: "failed",
+    terminal_reason: "context_too_large" });
+  deep.dispose();
+});
+
+test("Codex quick peer cache key is stable per root and survives clamping", async () => {
+  const clampUrl = "file:///C:/Users/USER/.bun/install/global/node_modules/@earendil-works/pi-ai/dist/api/openai-prompt-cache.js";
+  const { clampOpenAIPromptCacheKey } = await import(clampUrl) as {
+      clampOpenAIPromptCacheKey(key: string | undefined): string | undefined;
+    };
+  const expected = createHash("sha256").update("main-session").digest("hex").slice(0, 32) + ":peer:quick";
+  const h = codexAskHarness(finalCodexStream());
+  value(await h.ask("cache-a"));
+  value(await h.ask("cache-b"));
+  expect(h.streamCalls.map((call) => call.sessionId)).toEqual([expected, expected]);
+  expect(expected.length).toBeLessThanOrEqual(64);
+  expect(expected).toContain(":peer:");
+  expect(clampOpenAIPromptCacheKey(expected)).toBe(expected);
+  h.dispose();
+
+  for (const root of ["a".repeat(36), "b".repeat(70)]) {
+    const clampedRoot = root.length <= 64 ? root : root.slice(0, 64);
+    expect(clampOpenAIPromptCacheKey(root)).toBe(clampedRoot);
+    const scoped = codexAskHarness(finalCodexStream(), { sessionId: root });
+    value(await scoped.ask("scoped"));
+    const key = String(scoped.streamCalls[0]?.sessionId);
+    expect(key).toBe(createHash("sha256").update(root).digest("hex").slice(0, 32) + ":peer:quick");
+    expect(key.length).toBeLessThanOrEqual(64);
+    expect(clampOpenAIPromptCacheKey(key)).toBe(key);
+    expect(key).not.toBe(clampedRoot);
+    scoped.dispose();
+  }
+
+  const left = codexAskHarness(finalCodexStream(), { sessionId: "left-root" });
+  const right = codexAskHarness(finalCodexStream(), { sessionId: "right-root" });
+  value(await left.ask("left"));
+  value(await right.ask("right"));
+  expect(left.streamCalls[0]?.sessionId).not.toBe(right.streamCalls[0]?.sessionId);
+  left.dispose();
+  right.dispose();
+
+  // A missing root session id is refused before any stream call.
+  const missing = codexAskHarness(finalCodexStream(), { sessionId: undefined });
+  expect(value(await missing.ask("missing-session"))).toMatchObject({ state: "failed",
+    terminal_reason: "unsupported_runtime" });
+  expect(missing.streamCalls).toHaveLength(0);
+  missing.dispose();
+
+  // Deep and non-Codex asks keep the per-ask uuid key.
+  const deep = codexAskHarness(finalCodexStream());
+  value(await deep.ask("deep-a", { depth: "deep" }));
+  value(await deep.ask("deep-b", { depth: "deep" }));
+  for (const call of deep.streamCalls) expect(String(call.sessionId)).toMatch(/^main-session:peer:[0-9a-f-]{36}$/);
+  expect(deep.streamCalls[0]?.sessionId).not.toBe(deep.streamCalls[1]?.sessionId);
+  deep.dispose();
+  const plain = codexAskHarness(finalCodexStream(),
+    { model: { ...codexQuickModel(), id: "gpt-unit", api: "openai-responses" } });
+  value(await plain.ask("plain-a"));
+  value(await plain.ask("plain-b"));
+  for (const call of plain.streamCalls) expect(String(call.sessionId)).toMatch(/^main-session:peer:[0-9a-f-]{36}$/);
+  expect(plain.streamCalls[0]?.sessionId).not.toBe(plain.streamCalls[1]?.sessionId);
+  plain.dispose();
 });
 
 test("the Claude subscription lane runs one tool-less low-effort side query and caps the visible reply on the stream", async () => {
