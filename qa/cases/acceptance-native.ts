@@ -72,11 +72,32 @@ export async function nativeAcceptance(name: FinalCase, sandbox: string, artifac
     return result;
   } as typeof fs.linkSync;
   const originalSpawn = childProcess.spawn, spawned: Json[] = [];
+  let processSpawnHook: ((row: Json) => void) | undefined;
+  // Exact ownership: the task manager gives its own RPC child
+  // <state_dir>/children/<task_id>/sessions/<task_id>, so this is checkable against the task record.
+  const ownedRpcTask = (row: Json, options: any): string | undefined => {
+    if (!row.argv.includes("--mode") || !row.argv.includes("rpc")) return undefined;
+    const childEnv = options?.env as Record<string, string | undefined> | undefined;
+    if (childEnv?.OMO_SENPI_TASK_RPC_CHILD !== "1") return undefined;
+    const sessionDir = childEnv?.SENPI_CODING_AGENT_SESSION_DIR;
+    if (typeof sessionDir !== "string") return undefined;
+    const dir = path.resolve(sessionDir), children = path.resolve(path.join(sandbox, "senpi-task", "children"));
+    if (!dir.toLowerCase().startsWith(children.toLowerCase() + path.sep)) return undefined;
+    // The native layout is children/<task_id>/sessions/<task_id>; the middle segment is never
+    // the task id, so both task segments must agree and the middle one must be "sessions".
+    const segments = path.relative(children, dir).split(path.sep);
+    const [task, sessions, session] = segments;
+    if (segments.length !== 3 || sessions !== "sessions" || task !== session || !task) return undefined;
+    return /^st_[a-z0-9]+$/.test(task) ? task : undefined;
+  };
   childProcess.spawn = function (this: typeof childProcess, ...args: any[]) {
     const child = Reflect.apply(originalSpawn, this, args as any);
-    const row = { executable: args[0], argv: [args[0], ...(Array.isArray(args[1]) ? args[1] : [])],
+    const row: Json = { executable: args[0], argv: [args[0], ...(Array.isArray(args[1]) ? args[1] : [])],
       pid: child.pid, observed_at: new Date().toISOString(), cwd: args[2]?.cwd };
+    const owner = ownedRpcTask(row, args[2]);
+    if (owner) row.owner_task_id = owner;
     spawned.push(row); save(path.join(sandbox, "spawned.json"), spawned);
+    processSpawnHook?.(row);
     return child;
   } as typeof childProcess.spawn;
   syncBuiltinESMExports();
@@ -398,21 +419,55 @@ export async function nativeAcceptance(name: FinalCase, sandbox: string, artifac
       processGate = path.join(sandbox, "process-gate"); fs.mkdirSync(processGate);
       process.env.COORDINATION_ACCEPTANCE_GATE = processGate;
       let watch: fs.FSWatcher | undefined;
-      const ready = bounded(new Promise<void>((resolve, reject) => {
+      // Both subscriptions exist before the trigger. The unchanged 30000 ms bound is armed only by
+      // the exact owned --mode rpc spawn, never by --list-models, another child, or execute() return.
+      let readyAt: string | undefined;
+      const ready = new Promise<void>((resolve, reject) => {
         watch = fs.watch(processGate!, (_kind, file) => {
-          if (String(file) === "ready.json") { watch?.close(); resolve(); }
+          if (String(file) === "ready.json") { watch?.close(); readyAt = new Date().toISOString(); resolve(); }
           if (String(file) === "provider-error.json") {
             watch?.close(); reject(new Error(`PROCESS_PROVIDER_ERROR:${path.join(processGate!, "provider-error.json")}`));
           }
         });
         watch.on("error", reject);
-      }), "actual process model tool calls", 30_000);
+      });
+      void ready.catch(() => {});
+      let readiness: Promise<void> | undefined, readinessTimer: ReturnType<typeof setTimeout> | undefined;
+      let readinessArmedAt: string | undefined, ownedRpcSpawn: Json | undefined;
+      // Pre-registered before the trigger: the actual spawn signal, not execute()'s return,
+      // is the observation this block awaits.
+      let resolveOwnedSpawn!: (row: Json) => void;
+      const ownedSpawnObserved = new Promise<Json>(resolve => { resolveOwnedSpawn = resolve; });
+      const armReadiness = () => {
+        if (readiness) return;
+        readinessArmedAt = new Date().toISOString();
+        readiness = Promise.race([ready, new Promise<never>((_resolve, reject) => {
+          readinessTimer = setTimeout(() => reject(new Error("ACCEPTANCE_EVENT_DEADLINE:actual process model tool calls")), 30_000);
+        })]);
+        void readiness.finally(() => { if (readinessTimer) clearTimeout(readinessTimer); }).catch(() => {});
+      };
+      processSpawnHook = (row: Json) => {
+        if (!row.owner_task_id) return;
+        assert(!ownedRpcSpawn, `DUPLICATE_OWNED_RPC_SPAWN:${ownedRpcSpawn?.pid},${row.pid}`);
+        ownedRpcSpawn = row; armReadiness(); resolveOwnedSpawn(row);
+      };
       let processId: string;
       try {
         const launched = await execute("task", { subagent_type: "acceptance-process", model: "coordination-acceptance/offline",
           execution_mode: "process", prompt: "ACCEPTANCE_HOLD:rpc", description: "Final process registered-tool proof", run_in_background: true });
-        processId = launched.details.task_id; assert(processId); processHandle = engine.manager.getResidentHandle(processId); await ready;
-      } finally { watch?.close(); }
+        processId = launched.details.task_id; assert(processId);
+        // Await the pre-registered actual spawn observation; execute()'s return proves nothing.
+        const spawnRow = await ownedSpawnObserved;
+        assert.equal(spawnRow.owner_task_id, processId, "OWNED_RPC_SPAWN_TASK_MISMATCH");
+        assert(Date.parse(readinessArmedAt!) >= Date.parse(spawnRow.observed_at), "RPC_READINESS_ARMED_BEFORE_SPAWN");
+        processHandle = engine.manager.getResidentHandle(processId); await readiness!;
+        report.rpc_readiness = { owner_task_id: spawnRow.owner_task_id, spawn_pid: spawnRow.pid,
+          spawned_at: spawnRow.observed_at, armed_at: readinessArmedAt, ready_at: readyAt, bound_ms: 30_000,
+          elapsed_ms: readyAt && readinessArmedAt ? Date.parse(readyAt) - Date.parse(readinessArmedAt) : null };
+      } finally {
+        watch?.close(); processSpawnHook = undefined;
+        if (readinessTimer) clearTimeout(readinessTimer);
+      }
       processHandle = engine.manager.getResidentHandle(processId); assert(processHandle, "ACTUAL_PROCESS_HANDLE_NOT_RESIDENT");
       const proof = JSON.parse(fs.readFileSync(path.join(processGate, "ready.json"), "utf8"));
       assert.notEqual(proof.pid, process.pid); assert.equal(processHandle.kind, "rpc");
