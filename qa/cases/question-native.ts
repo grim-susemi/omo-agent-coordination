@@ -17,7 +17,7 @@ import { disposableModelConfig, realModelProfile } from "../model-config.ts";
 
 export type QuestionCase = "busy-question" | "question-races" | "deep-abort" | "ask-policy" |
   "inspect-api" | "public-api-consumer" | "max-reasoning-nonce" | "deep-ask-long" | "question-process" |
-  "question-model-inventory";
+  "question-model-inventory" | "codex-quick-live";
 type Json = Record<string, any>;
 const captureKey = Symbol.for("omo.agent-coordination.capture.v1");
 const ok = <T>(result: { ok: true; value: T } | { ok: false; reason: string }): T => {
@@ -60,7 +60,8 @@ export async function runQuestionCase(name: QuestionCase) {
   const artifact = path.join(questionEvidence, `${name}-${randomUUID()}.json`);
   try {
     const result = await questionCommand(["node", fileURLToPath(import.meta.url), "--native-case", name,
-      "--sandbox", sandbox, "--result", artifact], name === "deep-ask-long" ? 600_000 : 180_000);
+      "--sandbox", sandbox, "--result", artifact], name === "deep-ask-long" ? 600_000
+      : name === "codex-quick-live" ? 480_000 : 180_000);
     assert.equal(result.exit, 0, `REAL_QUESTION_CASE_FAILED:${result.receiptPath}`);
     const report = JSON.parse(fs.readFileSync(artifact, "utf8"));
     assert.equal(report.passed, true, JSON.stringify(report.error));
@@ -97,6 +98,8 @@ async function nativeCase(name: QuestionCase, sandbox: string, artifact: string)
   let modelConfig: ReturnType<typeof disposableModelConfig> | undefined;
   let processHandle: any, processGate: string | undefined, registry: any;
   let stopTerminal = () => {};
+  // Paid live case only: backend-api request ledger, kept counting through cleanup.
+  let liveFetch: { requests: Json[]; restore(): void } | undefined;
   try {
     manifest = buildAdapter({ output: path.join(sandbox, "candidate/omo-task.js") });
     process.env.COORDINATION_CANDIDATE_BUNDLE = manifest.output;
@@ -124,7 +127,8 @@ async function nativeCase(name: QuestionCase, sandbox: string, artifact: string)
     await loader.reload();
     assert.deepEqual(loader.getExtensions().errors, [], "QUESTION_NATIVE_LOADER_FAILED");
     const auth = AuthStorage.inMemory();
-    const realModel = name === "max-reasoning-nonce" || name === "deep-ask-long" || name === "question-model-inventory";
+    const realModel = name === "max-reasoning-nonce" || name === "deep-ask-long" ||
+      name === "question-model-inventory" || name === "codex-quick-live";
     const { ModelRuntime } = await import(pathToFileURL(senpi + "/dist/core/model-runtime.js").href);
     const { InMemoryCodingAgentModelsStore } = await import(pathToFileURL(senpi + "/dist/core/models-store.js").href);
     const modelsStore = new InMemoryCodingAgentModelsStore();
@@ -571,6 +575,203 @@ async function nativeCase(name: QuestionCase, sandbox: string, artifact: string)
         report.real_provider_requests = deniedRequests;
         report.network_deny = { loopback_hosts: [...loopbackHosts], denied_requests: deniedRequests };
       }
+    } else if (name === "codex-quick-live") {
+      // Paid, single-admission live proof. Record only method/path/status/content-encoding
+      // of chatgpt.com backend traffic: never other headers, tokens, or bodies (the body
+      // is zstd-compressed and carries the root's question).
+      const nativeFetch = globalThis.fetch;
+      const providerRequests: Json[] = [];
+      const observedFetch = (async (input: any, init?: any) => {
+        const raw = typeof input === "string" ? input : input instanceof URL ? input.href : input?.url;
+        let url: URL | undefined;
+        try { url = new URL(String(raw)); } catch { url = undefined; }
+        const counted = !!url && url.origin === "https://chatgpt.com" && url.pathname.startsWith("/backend-api");
+        const record: Json = { method: String(init?.method ?? "GET").toUpperCase(), path: url?.pathname ?? null };
+        let response: Response;
+        try { response = await nativeFetch(input, init); }
+        catch (error) {
+          if (counted) providerRequests.push({ ...record, status: null, content_encoding: null,
+            error: "network_error" });
+          throw error;
+        }
+        if (counted) providerRequests.push({ ...record, status: response.status,
+          content_encoding: response.headers.get("content-encoding") ?? null });
+        return response;
+      }) as typeof fetch;
+      globalThis.fetch = observedFetch;
+      liveFetch = { requests: providerRequests, restore: () => { globalThis.fetch = nativeFetch; } };
+      // Observe the options the product passes to the provider. The peer cache key is
+      // never stored, only its sha256, its length and the ":peer:" marker.
+      const modelRuntime = root.modelRuntime;
+      const originalStream = modelRuntime.stream;
+      const streamCalls: Json[] = [];
+      modelRuntime.stream = function (model: any, context: any, options: any) {
+        if (model?.api === "openai-codex-responses") {
+          const sessionId = typeof options?.sessionId === "string" ? options.sessionId : null;
+          streamCalls.push({ model: `${model.provider}/${model.id}`, api: model.api,
+            transport: options?.transport ?? null, max_retries: options?.maxRetries ?? null,
+            session_id_sha256: sessionId ? createHash("sha256").update(sessionId).digest("hex") : null,
+            session_id_length: sessionId?.length ?? null,
+            session_id_peer_marker: sessionId?.includes(":peer:") ?? false });
+        }
+        return Reflect.apply(originalStream, this, [model, context, options]);
+      };
+      const capturedRoot = ok<any>(state.capture.forRuntime(root));
+      assert.equal(capturedRoot.runtime(), root, "LIVE_CAPTURE_RUNTIME_MISMATCH");
+      const liveModel = registry.find("chatgpt-subscription", "gpt-6.1-sol");
+      assert(liveModel && liveModel.api === "openai-codex-responses", "LIVE_MODEL_NOT_AVAILABLE");
+      assert(registry.hasConfiguredAuth(liveModel), "LIVE_MODEL_AUTH_NOT_CONFIGURED");
+      const originalModel = root.model, originalThinking = root.thinkingLevel;
+      // The cache key is derived from this session id; refuse before any paid ask if absent.
+      assert(typeof root.sessionId === "string" && root.sessionId.length > 0, "LIVE_SESSION_ID_MISSING");
+      const admission = path.join(questionEvidence, "codex-quick-live-single-request.json");
+      const nonceA = randomUUID().replaceAll("-", ""), nonceB = randomUUID().replaceAll("-", "");
+      const requestA = `codex-quick:${randomUUID()}`, requestB = `codex-quick:${randomUUID()}`;
+      const childClient = ok(getCoordinationClient(a.ctx)); clients.push(childClient);
+      const childRoot = ok(childClient.peers()).peers.find((peer) => peer.role === "root");
+      assert(childRoot, "LIVE_ROOT_NOT_VISIBLE_TO_CHILD");
+      assert.equal(childRoot.target_ref, rootRef, "LIVE_ROOT_REF_MISMATCH");
+      const askA = { target_ref: childRoot.target_ref, request_id: requestA, depth: "quick" as const,
+        timeout_ms: 60000, question: `Reply with exactly this nonce in plain text: ${nonceA}. Do not use tools.` };
+      const askB = { target_ref: childRoot.target_ref, request_id: requestB, depth: "quick" as const,
+        timeout_ms: 60000, question: `Reply with exactly this nonce in plain text: ${nonceB}. Do not use tools.` };
+      const summarize = (receipt: any, nonce: string) => ({ request_id: receipt.request_id, nonce,
+        nonce_observed: String(receipt.reply ?? "").includes(nonce), reply: receipt.reply,
+        state: receipt.state, terminal_reason: receipt.terminal_reason ?? null,
+        completion: receipt.completion ?? null, depth: receipt.depth, latency_ms: receipt.latency_ms,
+        usage: receipt.usage, logical_provider_requests: receipt.logical_provider_requests,
+        physical_provider_attempts: receipt.physical_provider_attempts,
+        target_model: receipt.target_model, target_route: receipt.target_route,
+        target_thinking_before: receipt.target_thinking_before,
+        main_thinking_unchanged: receipt.main_thinking_unchanged,
+        side_thinking_policy: receipt.side_thinking_policy,
+        effective_side_thinking: receipt.effective_side_thinking,
+        effective_side_reasoning_budget: receipt.effective_side_reasoning_budget,
+        effective_side_output_budget: receipt.effective_side_output_budget,
+        provider_controls: receipt.provider_controls });
+      try {
+        assert(await root.setModel(liveModel), "LIVE_MODEL_NOT_REACHABLE");
+        root.setSessionThinkingLevel("high");
+        assert.equal(root.thinkingLevel, "high", "LIVE_HIGH_THINKING_UNAVAILABLE");
+        const before = { model: fingerprint(root.model), thinking: root.thinkingLevel,
+          history: fingerprint(root.messages), messages: root.messages.length };
+        // Permanent single admission: after setup, immediately before ask A.
+        const fd = fs.openSync(admission, "wx");
+        try {
+          fs.writeFileSync(fd, JSON.stringify({ case: name, admitted_at: new Date().toISOString(),
+            source_sha256: questionHashes(), selected: { provider: liveModel.provider, id: liveModel.id,
+              api: liveModel.api, context_window: liveModel.contextWindow, max_tokens: liveModel.maxTokens },
+            request_ids: { a: requestA, b: requestB, replay: requestA }, planned_physical_posts: 2,
+            logical_request_limit: 3, app_retries: 0, fallback: 0, credentials_copied: false,
+            credential_path: realModelProfile + "/auth.json",
+            credential_access: "native ReadOnlyAuthStorage, read-only" }, null, 2) + "\n");
+        } finally { fs.closeSync(fd); }
+        const resultA = await childClient.ask(askA);
+        assert(resultA.ok, JSON.stringify(resultA));
+        const receiptA = resultA.value;
+        assert.equal(receiptA.state, "replied", JSON.stringify({ reason: receiptA.terminal_reason }));
+        assert(String(receiptA.reply ?? "").includes(nonceA), "LIVE_NONCE_A_NOT_OBSERVED");
+        const resultB = await childClient.ask(askB);
+        assert(resultB.ok, JSON.stringify(resultB));
+        const receiptB = resultB.value;
+        assert.equal(receiptB.state, "replied", JSON.stringify({ reason: receiptB.terminal_reason }));
+        assert(String(receiptB.reply ?? "").includes(nonceB), "LIVE_NONCE_B_NOT_OBSERVED");
+        for (const receipt of [receiptA, receiptB]) {
+          assert.equal(receipt.depth, "quick");
+          assert.equal(receipt.logical_provider_requests, 1, "LIVE_LOGICAL_REQUESTS");
+          assert.equal(receipt.physical_provider_attempts, 1, "LIVE_PHYSICAL_ATTEMPTS");
+          assert.equal(receipt.target_thinking_before, "high");
+          assert.equal(receipt.main_thinking_unchanged, true);
+          assert.equal(receipt.side_thinking_policy, "low-cap-v1");
+          assert.equal(receipt.effective_side_thinking, "low");
+          assert.equal(receipt.effective_side_reasoning_budget, null);
+          assert.equal(receipt.effective_side_output_budget, Math.min(liveModel.maxTokens, 4096));
+          assert(String(receipt.target_model).endsWith("/gpt-6.1-sol"), String(receipt.target_model));
+          const controls = receipt.provider_controls;
+          assert.equal(controls.wire_output_budget, null, "LIVE_WIRE_CEILING");
+          assert.equal(controls.output_cap, "client_abort");
+          assert.equal(controls.output_cap_scope, "visible_text");
+          assert.equal(controls.client_output_limit_utf8_bytes, 4096);
+          assert.equal(controls.lane_internal_retry, "possible");
+          assert.equal(controls.physical_attempts_basis, "payload_hook");
+          assert.equal(controls.physical_attempts_wire_verified, false);
+          assert.equal(controls.wire_reasoning_effort, "low");
+          assert.equal(controls.wire_service_tier, null);
+          assert.equal(controls.maxRetries, 0);
+          assert.equal(controls.toolChoice, "none");
+          assert(typeof controls.wire_input_utf8_bytes === "number" && controls.wire_input_utf8_bytes > 0,
+            "LIVE_WIRE_INPUT_BYTES");
+          assert(typeof controls.input_bound_utf8_bytes === "number" && controls.input_bound_utf8_bytes > 0,
+            "LIVE_INPUT_BOUND");
+          assert(typeof controls.input_token_estimate === "number", "LIVE_INPUT_ESTIMATE");
+          assert(typeof controls.input_tokens_estimated_tail === "number", "LIVE_INPUT_TAIL");
+          assert(typeof controls.context_window === "number" && controls.context_window > 0,
+            "LIVE_CONTEXT_WINDOW");
+        }
+        const postsAfterAsks = providerRequests.filter((row) => row.method === "POST").length;
+        const replay = await childClient.ask(askA);
+        assert(replay.ok, JSON.stringify(replay));
+        assert.deepEqual(replay.value, receiptA, "LIVE_REPLAY_RECEIPT_NOT_IDENTICAL");
+        const postsAfterReplay = providerRequests.filter((row) => row.method === "POST").length;
+        assert.equal(postsAfterReplay - postsAfterAsks, 0, "LIVE_REPLAY_SENT_POST");
+        assert.equal(postsAfterReplay, 2, "LIVE_POST_COUNT_NOT_TWO");
+        assert.equal(streamCalls.length, 2, "LIVE_STREAM_CALL_COUNT_NOT_TWO");
+        const expectedKey = `${createHash("sha256").update(root.sessionId).digest("hex").slice(0, 32)}:peer:quick`;
+        const expectedKeyHash = createHash("sha256").update(expectedKey).digest("hex");
+        for (const call of streamCalls) {
+          assert.equal(call.api, "openai-codex-responses");
+          assert.equal(call.transport, "sse", "LIVE_TRANSPORT_NOT_SSE");
+          assert.equal(call.max_retries, 0);
+          assert.equal(call.session_id_sha256, expectedKeyHash, "LIVE_CACHE_KEY_NOT_STABLE");
+          assert.equal(call.session_id_length, 43);
+          assert.equal(call.session_id_peer_marker, true);
+        }
+        const after = { model: fingerprint(root.model), thinking: root.thinkingLevel,
+          history: fingerprint(root.messages), messages: root.messages.length };
+        assert.equal(after.model, before.model, "LIVE_ROOT_MODEL_CHANGED");
+        assert.equal(after.thinking, before.thinking, "LIVE_ROOT_THINKING_CHANGED");
+        assert.equal(after.history, before.history, "LIVE_ROOT_HISTORY_CHANGED");
+        const settingsPath = path.join(realModelProfile, "settings.json");
+        let concurrency: Json = { settings_path: settingsPath, settings_sha256: null,
+          "chatgpt-subscription": { maxConcurrency: null, providers_configured: false,
+            provider_configured: false } };
+        if (fs.existsSync(settingsPath)) {
+          const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+          const provider = settings?.providers?.["chatgpt-subscription"];
+          concurrency = { settings_path: settingsPath, settings_sha256: sha256(settingsPath),
+            "chatgpt-subscription": { maxConcurrency: provider?.maxConcurrency ?? null,
+              providers_configured: settings?.providers !== undefined,
+              provider_configured: provider !== undefined } };
+        }
+        report.live = {
+          model: "chatgpt-subscription/gpt-6.1-sol", thinking: "high", main_turn_prompted: false,
+          root_ref_source: "getCoordinationClient(childContext).peers()",
+          admission: { path: admission, exclusive: "wx", permanent: true },
+          root: { target_ref: rootRef, model_sha256_before: before.model,
+            model_sha256_after: after.model, thinking_before: before.thinking,
+            thinking_after: after.thinking, messages_before: before.messages,
+            messages_after: after.messages, history_sha256_before: before.history,
+            history_sha256_after: after.history, model_unchanged: true, thinking_unchanged: true,
+            messages_unchanged: true },
+          ask_a: summarize(receiptA, nonceA), ask_b: summarize(receiptB, nonceB),
+          replay: { request_id: requestA, identical_receipt: true, posts_added: 0,
+            posts_after_asks: postsAfterAsks, posts_after_replay: postsAfterReplay,
+            stream_calls_after_replay: streamCalls.length },
+          peer_cache: { key_sha256: expectedKeyHash, key_length: expectedKey.length,
+            key_has_peer_marker: true, a_session_id_sha256: streamCalls[0]!.session_id_sha256,
+            b_session_id_sha256: streamCalls[1]!.session_id_sha256, identical: true,
+            derivation: "sha256hex(root.sessionId).slice(0,32) + ':peer:quick', read from observed options.sessionId" },
+          providers: concurrency,
+          cache_usage: { a: receiptA.usage.cache, b: receiptB.usage.cache,
+            note: "receipt usage.cache is pi-ai usage.cacheRead as the provider reported it" },
+          provider_stream_options: streamCalls,
+          provider_requests_after_asks: providerRequests.map((row) => ({ ...row })),
+        };
+      } finally {
+        await root.setModel(originalModel);
+        root.setSessionThinkingLevel(originalThinking);
+        modelRuntime.stream = originalStream;
+      }
     } else {
       report.real_model = await realQuestion({ name, root, registry, rootRef, childContext: a.ctx, toolAsk });
       if (!report.real_model.passed) {
@@ -589,10 +790,10 @@ async function nativeCase(name: QuestionCase, sandbox: string, artifact: string)
     throw error;
   } finally {
     try {
-    // Builder-only inventory changes the owner's model without sending it.
+    // Builder-only inventory and the paid live case both change the owner's model.
     // Native child completion can prompt that owner during cleanup, so restore
     // the offline fixture before releasing any held child.
-    if (name === "question-model-inventory" && sessions[0]) {
+    if ((name === "question-model-inventory" || name === "codex-quick-live") && sessions[0]) {
       await sessions[0].setModel(registry.find("coordination-question", "offline"));
     }
     for (const label of labels) bus.emit(`release-main:${label}`);
@@ -621,6 +822,17 @@ async function nativeCase(name: QuestionCase, sandbox: string, artifact: string)
     report.cleanup = { sessions_disposed: sessions.every((session) => session._disposed),
       provider_listeners: bus.eventNames().length, installed_unchanged: sha256(bundle) === report.module_sha256_before[bundle] };
     } finally {
+    if (liveFetch) {
+      // Restore only after cleanup so the ledger covers every request it could send.
+      liveFetch.restore();
+      const requests = liveFetch.requests;
+      const posts = requests.filter((row) => row.method === "POST");
+      report.provider_request_counts = { filter: "https://chatgpt.com/backend-api",
+        recorded_fields: ["method", "path", "status", "content_encoding"],
+        requests, total_requests: requests.length, posts: posts.length, counted_through_cleanup: true };
+      // A request during cleanup would mean the root kept the paid model; fail the case.
+      if (report.passed === true) report.passed = posts.length === 2;
+    }
     if (modelConfig) report.model_config = modelConfig.dispose();
     report.ended_at = new Date().toISOString();
     fs.writeFileSync(artifact, JSON.stringify(report, null, 2) + "\n");

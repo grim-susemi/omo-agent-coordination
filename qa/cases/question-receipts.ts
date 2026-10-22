@@ -8,10 +8,16 @@ export const questionHashes = hashes;
 export async function questionCommand(argv: string[], timeoutMs = 180_000) {
   priorPreload("task-6/write-guard.cjs");
   const nativeCase = argv.indexOf("--native-case");
-  const real = nativeCase >= 0 && ["max-reasoning-nonce", "deep-ask-long"].includes(argv[nativeCase + 1]!);
-  const modelConfig = real || (nativeCase >= 0 && argv[nativeCase + 1] === "question-model-inventory");
+  const caseName = nativeCase >= 0 ? argv[nativeCase + 1]! : "";
+  const real = ["max-reasoning-nonce", "deep-ask-long"].includes(caseName);
+  // The live case writes its disposable models.json outside the evidence tree (like the
+  // real cases) and makes two asks of up to 60 s each, so it needs the model-config guard
+  // and the full timeout. It counts its own backend-api requests, so it stays out of the
+  // `real` list and its Ollama target pins.
+  const live = caseName === "codex-quick-live";
+  const modelConfig = real || live || caseName === "question-model-inventory";
   if (real) priorPreload("task-6/owner-target-pin.cjs");
-  return command(argv, { timeoutMs: real ? timeoutMs : Math.min(timeoutMs, 60_000),
+  return command(argv, { timeoutMs: real || live ? timeoutMs : Math.min(timeoutMs, 60_000),
     ...(modelConfig ? { env: { NODE_OPTIONS: [
       `--require="${priorPreload("task-10/attempt-2/write-guard.cjs")}"`,
       ...(real ? [`--require="${priorPreload("task-6/owner-target-pin-attempt-2.cjs")}"`] : []),
