@@ -328,6 +328,11 @@ export default async function coordinationCapture(pi: ExtensionAPI) {
     contexts.set(context.sessionManager, context);
     warnIfCarrierMissing(context as never, namespace, generation);
   });
+  // This official event follows all session_start handlers, including the
+  // native owner's binding. Adopting earlier can capture before that link exists.
+  pi.on("resources_discover", (_event, context) => {
+    capture.adopt(context.sessionManager);
+  });
   pi.on("session_shutdown", () => state.dispose());
   pi.on("session_extensions_removed", (event) => {
     const removed = (event as { removed: { path: string; resolvedPath: string }[] }).removed;

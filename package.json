@@ -17,7 +17,7 @@
   },
   "scripts": {
     "build": "bun build src/extension.ts src/public-api.ts --outdir dist --target node --format esm --external @code-yeongyu/senpi",
-    "check": "tsc --noEmit && bun test && bun run qa:isolated",
+    "check": "node qa/prepare.mjs && tsc --noEmit && bun test && bun run qa:isolated",
     "qa:isolated": "bun run qa/harness.ts",
     "qa:owned": "bun run qa/owned.ts"
   },

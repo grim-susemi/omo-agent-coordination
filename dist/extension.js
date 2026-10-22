@@ -8,6 +8,8 @@ var SUPPORTED_SENPI = new Set(["2026.10.19", "2026.10.19-2"]);
 var supportedVersion = (version) => version !== undefined && SUPPORTED_SENPI.has(version);
 var global = globalThis;
 var hooks = global[HOOKS] ??= new WeakMap;
+var BOUND_RUNTIMES = Symbol.for("omo.agent-coordination.bound-runtimes.v1");
+var boundRuntimes = global[BOUND_RUNTIMES] ??= new Set;
 function createRuntimeCapture(options) {
   const token = Symbol();
   const records = new WeakMap;
@@ -39,6 +41,16 @@ function createRuntimeCapture(options) {
       refusal = "runtime_shape";
       return;
     }
+    let remembered = false;
+    for (const ref2 of boundRuntimes) {
+      const actual = ref2.deref();
+      if (!actual || actual._disposed)
+        boundRuntimes.delete(ref2);
+      else if (actual === runtime)
+        remembered = true;
+    }
+    if (!remembered)
+      boundRuntimes.add(new WeakRef(runtime));
     seen.add(runtime);
     const ref = new WeakRef(runtime);
     const instance = randomUUID();
@@ -146,6 +158,19 @@ function createRuntimeCapture(options) {
     status,
     generation: options.generation,
     moduleReady,
+    adopt(sessionManager) {
+      if (disposed || refusal)
+        return;
+      for (const ref of boundRuntimes) {
+        const runtime = ref.deref();
+        if (!runtime || runtime._disposed) {
+          boundRuntimes.delete(ref);
+          continue;
+        }
+        if (runtime.sessionManager === sessionManager)
+          bound(runtime);
+      }
+    },
     list() {
       const result = [];
       for (const ref of live) {
@@ -4433,6 +4458,9 @@ ${JSON.stringify(result)}` }], details: result, isError: !result.ok };
   pi.on("session_start", (_event, context) => {
     contexts.set(context.sessionManager, context);
     warnIfCarrierMissing(context, namespace, generation);
+  });
+  pi.on("resources_discover", (_event, context) => {
+    capture.adopt(context.sessionManager);
   });
   pi.on("session_shutdown", () => state.dispose());
   pi.on("session_extensions_removed", (event) => {

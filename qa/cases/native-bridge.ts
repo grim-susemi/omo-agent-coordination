@@ -6,7 +6,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { attempt, bundle, isolatedEnv, product, senpi, sha256 } from "../command.mjs";
 import { commandReceipt, hashes, taskEvidence } from "./receipts.mjs";
-import { buildAdapter, removeAdapter, BASELINE } from "../../scripts/build-adapter.mjs";
+import { buildAdapter, removeAdapter } from "../../scripts/build-adapter.mjs";
 import { connectEngineBridge } from "../../src/engine-bridge.ts";
 import type { BridgeResult, EngineBridge, OutcomeWitness, SenpiNamespace } from "../../src/engine-bridge.ts";
 import type { TargetRef } from "../../src/contracts.ts";
@@ -484,7 +484,7 @@ async function nativeCase(scenario: Scenario, artifact: string): Promise<Json> {
     if (!enabled) assert.equal(sdk.AgentSession.prototype.bindExtensions, beforeHook);
     report.mode_absent_noop = !enabled;
     const removal = removeAdapter(manifest);
-    assert.equal(removal.restored_sha256, BASELINE);
+    assert.equal(removal.restored_sha256, sha256(bundle));
     report.removal = removal;
     const removeDrift = { ...manifest, output: path.join(sandbox, "removal-drift.js") };
     fs.writeFileSync(removeDrift.output, "not the candidate");

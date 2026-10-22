@@ -12,11 +12,11 @@ export const senpi = "C:/Users/USER/.bun/install/global/node_modules/@code-yeong
 export const omo = "C:/Users/USER/.bun/install/global/node_modules/omo-ai";
 export const installedBundle = path.join(omo, "plugin/extensions/omo-task.js");
 // QA always builds from preserved baseline bytes, even after the live carrier is installed.
-export const bundle = path.join(attempt, "baseline/omo-task.js");
+export const bundle = path.join(attempt, "baseline-5140/omo-task.js");
 export const sha256 = (file) => createHash("sha256").update(fs.readFileSync(file)).digest("hex");
-export function priorPreload(relative) {
+export function priorPreload(relative, outputRelative = relative) {
   const source = path.join(priorAttempt, relative);
-  const output = path.join(attempt, relative);
+  const output = path.join(attempt, outputRelative);
   // Legacy guards log beside __filename. Read their source, but execute with
   // the current output filename so neither logs nor sandbox writes touch prior evidence.
   fs.mkdirSync(path.dirname(output), { recursive: true });

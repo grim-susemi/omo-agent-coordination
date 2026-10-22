@@ -95,7 +95,7 @@ async function nativeCase(name: QuestionCase, sandbox: string, artifact: string)
     started_at: new Date().toISOString(), repair_enabled: false, passed: false };
   let manifest: ReturnType<typeof buildAdapter> | undefined, state: any;
   let modelConfig: ReturnType<typeof disposableModelConfig> | undefined;
-  let processHandle: any, processGate: string | undefined;
+  let processHandle: any, processGate: string | undefined, registry: any;
   let stopTerminal = () => {};
   try {
     manifest = buildAdapter({ output: path.join(sandbox, "candidate/omo-task.js") });
@@ -135,7 +135,6 @@ async function nativeCase(name: QuestionCase, sandbox: string, artifact: string)
       report.native_catalog = { path: nativeCatalog, sha256: sha256(nativeCatalog),
         access: "read-only file read; native in-memory catalog; no profile lock or cache writes" };
     }
-    let registry: any;
     if (realModel) {
       modelConfig = disposableModelConfig();
       const runtime = await ModelRuntime.create({ agentDir: env.OMO_CODING_AGENT_DIR,
@@ -524,6 +523,12 @@ async function nativeCase(name: QuestionCase, sandbox: string, artifact: string)
     throw error;
   } finally {
     try {
+    // Builder-only inventory changes the owner's model without sending it.
+    // Native child completion can prompt that owner during cleanup, so restore
+    // the offline fixture before releasing any held child.
+    if (name === "question-model-inventory" && sessions[0]) {
+      await sessions[0].setModel(registry.find("coordination-question", "offline"));
+    }
     for (const label of labels) bus.emit(`release-main:${label}`);
     bus.emit("release-side:abort-nonce");
     stopTerminal();

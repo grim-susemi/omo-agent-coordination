@@ -2,6 +2,75 @@ import { expect, test } from "bun:test";
 import { runCaptureCase } from "../qa/cases/capture-native.ts";
 import { createRuntimeCapture } from "../src/runtime-capture.ts";
 
+test("a fresh module generation adopts only live natively bound runtimes for the exact manager", async () => {
+  // Given separately evaluated module instances and native receiver validation.
+  const moduleUrl = "../src/runtime-capture.ts?gen=reload-test";
+  const generationB: typeof import("../src/runtime-capture.ts") = await import(moduleUrl);
+  expect(generationB.createRuntimeCapture).not.toBe(createRuntimeCapture);
+  const nativeInstances = new WeakSet<object>();
+  class Session {
+    sessionId = crypto.randomUUID();
+    sessionManager = { getSessionId: () => this.sessionId, getLeafId: () => null };
+    model = { provider: "capture", id: "offline" };
+    modelRuntime = {};
+    systemPrompt = "";
+    messages: unknown[] = [];
+    activitySnapshot = { isStreaming: false, isBashRunning: false, isCompacting: false,
+      hasSessionWork: false, hasActiveWakeSource: false };
+    _disposed = false;
+    constructor() { nativeInstances.add(this); }
+    async bindExtensions() {
+      if (!nativeInstances.has(this)) throw new TypeError("Invalid native receiver");
+    }
+    dispose() { this._disposed = true; }
+    subscribe() { return () => {}; }
+  }
+  const loaderNamespace = { AgentSession: Session, VERSION: "2026.10.19-2" };
+  const a = createRuntimeCapture({ loaderNamespace, generation: 1 });
+  const root = new Session();
+  const closed = new Session();
+  const unbound = new Session();
+  const forged = Object.assign(Object.create(Session.prototype), new Session());
+  try {
+    await root.bindExtensions();
+    await closed.bindExtensions();
+    await expect(Reflect.apply(Session.prototype.bindExtensions, forged, [])).rejects.toThrow("Invalid native receiver");
+    closed.dispose();
+    const old = a.forRuntime(root);
+    a.dispose();
+    const next = generationB.createRuntimeCapture({ loaderNamespace, generation: 2 });
+    let bounds = 0;
+    next.onRuntime((_capture, event) => { if (event === "bound") bounds++; });
+    try {
+      // When reload supplies the original manager, without rebinding the runtime.
+      next.adopt({ ...root.sessionManager });
+      next.adopt(closed.sessionManager);
+      next.adopt(unbound.sessionManager);
+      next.adopt(forged.sessionManager);
+      expect(next.list()).toHaveLength(0);
+      next.adopt(root.sessionManager);
+      next.adopt(root.sessionManager);
+      // Then exactly one fresh capture is emitted and old captures remain stale.
+      expect(bounds).toBe(1);
+      expect(next.forRuntime(root).ok).toBe(true);
+      expect(next.list()).toHaveLength(1);
+      expect(next.forRuntime(closed).ok).toBe(false);
+      expect(next.forRuntime(unbound).ok).toBe(false);
+      expect(next.forRuntime(forged).ok).toBe(false);
+      if (old.ok) expect(old.value.read()).toEqual({ ok: false, reason: "stale_generation" });
+    } finally { next.dispose(); }
+  } finally { a.dispose(); root.dispose(); }
+});
+
+test("reload recaptures the same root and reconnects API v1 on its next turn", async () => {
+  const result = await runCaptureCase("capture-reload");
+  expect(result.passed).toBe(true);
+  expect(result.reload).toMatchObject({
+    captured: true, bridge: true, inspect: { ok: true },
+    next_turn_api_version: 1, next_turn_connected: true,
+  });
+}, 120_000);
+
 test("capture accepts the exact lazy native SDK class alongside the bundled loader, not a foreign class", async () => {
   const sessionClass = () => class {
     sessionId = crypto.randomUUID();

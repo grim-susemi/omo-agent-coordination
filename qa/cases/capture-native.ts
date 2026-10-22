@@ -6,12 +6,13 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { buildAdapter, removeAdapter } from "../../scripts/build-adapter.mjs";
 import { createRuntimeCapture } from "../../src/runtime-capture.ts";
+import { getCoordinationBroker } from "../../src/public-api.ts";
 import type { LiveSession, CaptureResult } from "../../src/runtime-capture.ts";
 import type { CaptureExtensionState } from "../../src/extension.ts";
 import { attempt, product, senpi, bundle, isolatedEnv, sha256 } from "../command.mjs";
 import { captureCommand, captureEvidence, captureHashes } from "./capture-receipts.ts";
 
-type Case = "capture-in-process" | "capture-process" | "capture-unsupported";
+type Case = "capture-in-process" | "capture-process" | "capture-unsupported" | "capture-reload";
 type Json = Record<string, any>;
 const stateKey = Symbol.for("omo.agent-coordination.capture.v1");
 function value<T>(result: CaptureResult<T>): T {
@@ -114,7 +115,10 @@ async function nativeCase(name: Case, sandbox: string, artifact: string) {
     metadata_sha256: sha256(path.join(sdkMetadata, "package.json")),
     actual_sdk_entry: senpi + "/dist/index.js", copied_runtime_code: false };
   try {
-    manifest = buildAdapter({ output: path.join(sandbox, "candidate/omo-task.js") });
+    manifest = buildAdapter({
+      ...(name === "capture-reload" ? { input: path.join(attempt, "baseline-5140/omo-task.js") } : {}),
+      output: path.join(sandbox, "candidate/omo-task.js"),
+    });
     process.env.COORDINATION_CANDIDATE_BUNDLE = manifest.output;
     const mode = name === "capture-process" ? "process" : "in-process";
     const packages = ["C:/Users/USER/.omo-stable-500/home/.omo/agent/task-no-fallback-pkg", packageDir];
@@ -160,7 +164,9 @@ async function nativeCase(name: Case, sandbox: string, artifact: string) {
       modelRegistry: registry, sessionManager: sdk.SessionManager.inMemory(cwd),
     })).session;
     sessions.push(root);
-    await root.bindExtensions({ mode: "print" });
+    await root.bindExtensions({ mode: "print",
+      ...(name === "capture-reload" ? { shutdownHandler: async () => {} } : {}),
+    });
     await root.setModel(registry.find("coordination-capture", "offline"));
     const state = global[stateKey] as CaptureExtensionState;
     assert(state?.capture.status.ok, "ROOT_CAPTURE_NOT_ACTIVE");
@@ -169,6 +175,45 @@ async function nativeCase(name: Case, sandbox: string, artifact: string) {
     assert.equal(value(parentCapture.read()).model_runtime, root.modelRuntime);
     const bridge = state.bridges.get(root.sessionManager);
     assert(bridge, `NATIVE_OWNER_CONNECTION_MISSING: ${[...state.unsupported]}`);
+    if (name === "capture-reload") {
+      // Given a natively bound root, exercise the real no-cache Node loader.
+      const previousGeneration = state.generation;
+      // When extensions rebuild without another bindExtensions call.
+      await root.reload();
+      const next = global[stateKey] as CaptureExtensionState;
+      const captured = next.capture.forRuntime(root);
+      const context = root.extensionRunner.createContext();
+      const inspect = await root.extensionRunner.getToolDefinition("coordination_inspect")
+        .execute(randomUUID(), {}, undefined, undefined, context);
+      report.reload = { generation_before: previousGeneration, generation_after: next.generation,
+        captured: captured.ok, bridge: next.bridges.has(root.sessionManager), inspect: inspect.details };
+      // Then the new generation owns the same runtime and exposes the public API.
+      assert.equal(next.generation, previousGeneration + 1);
+      assert.equal(captured.ok, true, `RELOAD_CAPTURE_MISSING: ${JSON.stringify(report.reload)}`);
+      assert(next.bridges.has(root.sessionManager), "RELOAD_OWNER_CONNECTION_MISSING");
+      assert.equal(inspect.details.ok, true, JSON.stringify(inspect.details));
+      await bounded(root.prompt("CAPTURE_RELOAD_NEXT_TURN"), "post-reload root turn");
+      const broker = getCoordinationBroker();
+      assert(broker.ok, JSON.stringify(broker));
+      assert.equal(broker.value.version, 1);
+      const client = broker.value.getClient(root.extensionRunner.createContext());
+      assert(client.ok, JSON.stringify(client));
+      assert.equal(client.value.peers().ok, true);
+      client.value.dispose();
+      report.reload.next_turn_api_version = broker.value.version;
+      report.reload.next_turn_connected = true;
+      // Use the installed Collab controller's actual status projection without
+      // starting a viewer or touching any live pane/status file.
+      const dashboard = "C:/Users/USER/.omo-stable-500/home/.omo/agent/herdr-dashboard/integration";
+      const current = JSON.parse(fs.readFileSync(path.join(dashboard, "current.json"), "utf8"));
+      const controller = path.join(dashboard, current.generation, "coordination/src/controller.mjs");
+      const { connectionStatus } = await import(pathToFileURL(controller).href);
+      report.reload.collab = await connectionStatus();
+      report.reload.collab_controller_sha256 = sha256(controller);
+      assert.deepEqual(report.reload.collab, { state: "connected", protocol: "api v1", baseline: null });
+      report.passed = true;
+      return report;
+    }
     const holder = global[Symbol.for("omo.senpi-task.senpiBarrel")];
     const descriptor = holder && Object.getOwnPropertyDescriptor(holder, "module");
     const moduleReadyBeforeChild = state.capture.list().length === 1;

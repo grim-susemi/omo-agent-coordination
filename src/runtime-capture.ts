@@ -62,6 +62,10 @@ const SUPPORTED_SENPI = new Set(["2026.10.19", "2026.10.19-2"]);
 const supportedVersion = (version: string | undefined) => version !== undefined && SUPPORTED_SENPI.has(version);
 const global = globalThis as unknown as Record<symbol, unknown>;
 const hooks = (global[HOOKS] ??= new WeakMap<Prototype, Hook>()) as WeakMap<Prototype, Hook>;
+// Reload re-evaluates this module and does not call bindExtensions again.
+// Keep only weak references to runtimes admitted by a successful native bind.
+const BOUND_RUNTIMES = Symbol.for("omo.agent-coordination.bound-runtimes.v1");
+const boundRuntimes = (global[BOUND_RUNTIMES] ??= new Set<WeakRef<LiveSession>>()) as Set<WeakRef<LiveSession>>;
 
 /** A birth observation is not ownership. Only bindOwned's native bridge may authorize a worker.
  * No transcript, credentials, queued draft, provider request, or session setter is used here.
@@ -105,6 +109,13 @@ export function createRuntimeCapture(options: {
       refusal = "runtime_shape";
       return;
     }
+    let remembered = false;
+    for (const ref of boundRuntimes) {
+      const actual = ref.deref();
+      if (!actual || actual._disposed) boundRuntimes.delete(ref);
+      else if (actual === runtime) remembered = true;
+    }
+    if (!remembered) boundRuntimes.add(new WeakRef(runtime));
     seen.add(runtime);
     const ref = new WeakRef(runtime);
     const instance = randomUUID();
@@ -191,6 +202,14 @@ export function createRuntimeCapture(options: {
   const status = moduleReady(options.loaderNamespace);
   return Object.freeze({
     status, generation: options.generation, moduleReady,
+    adopt(sessionManager: object): void {
+      if (disposed || refusal) return;
+      for (const ref of boundRuntimes) {
+        const runtime = ref.deref();
+        if (!runtime || runtime._disposed) { boundRuntimes.delete(ref); continue; }
+        if (runtime.sessionManager === sessionManager) bound(runtime);
+      }
+    },
     list(): readonly CapturedRuntime[] {
       const result: CapturedRuntime[] = [];
       for (const ref of live) {

@@ -3,7 +3,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { attempt, product, bundle, senpi, isolatedEnv, sha256 } from "../command.mjs";
+import { attempt, product, bundle, senpi, isolatedEnv, sha256, priorPreload } from "../command.mjs";
 
 export const inspectEvidence = path.join(attempt, "task-4");
 export function inspectHashes() {
@@ -37,8 +37,9 @@ export async function inspectCommand(argv: string[], cwd = product, preload?: st
     pid: undefined as number | undefined, error: undefined as string | undefined };
   const save = () => fs.writeFileSync(receiptPath, JSON.stringify(receipt, null, 2) + "\n");
   const env = isolatedEnv(path.join(inspectEvidence, "commands", id));
-  if (preload) env.NODE_OPTIONS = `--require="${preload}"`;
-  else if (process.env.NODE_OPTIONS) env.NODE_OPTIONS = process.env.NODE_OPTIONS;
+  // Keep containment, but never inherit another suite's task-local allowlist.
+  const guard = preload ?? priorPreload("task-2/write-guard.cjs", "task-4/write-guard.cjs");
+  env.NODE_OPTIONS = `--require="${guard}"`;
   const fd = fs.openSync(raw, "wx");
   save();
   const child = spawn(resolved[0]!, resolved.slice(1), {
