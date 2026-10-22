@@ -17,6 +17,7 @@ function value<T>(result: Result<T>): T {
   if (!result.ok) throw new Error(result.reason);
   return result.value;
 }
+type Json = Record<string, any>;
 function fixture() {
   let clock = 1000;
   const timers = new Set<{ at: number; callback(): void }>();
@@ -341,11 +342,6 @@ test("request-local options cap supported wire families and never change the inp
     });
     expect(model).toEqual(before);
   }
-  for (const alias of ["sol-61", "sol-max"]) {
-    const model = { id: alias, api: "openai-codex-responses", reasoning: true, maxTokens: 32000 };
-    expect(sideThinkingOptions(model, "high", "quick")).toEqual({ ok: false, reason: "reasoning_policy_unsupported" });
-    expect(value(sideThinkingOptions(model, "high", "deep")).thinking).toBe("high");
-  }
   expect(value(sideThinkingOptions({ api: "anthropic-messages", reasoning: true, maxTokens: 32000 },
     "high", "quick")).options).toEqual({ maxTokens: 4096, thinkingEnabled: false });
   expect(sideThinkingOptions({ api: "unknown", reasoning: true, maxTokens: 32000 }, "high", "quick"))
@@ -359,6 +355,561 @@ test("request-local options cap supported wire families and never change the inp
   expect(value(sideThinkingOptions(subscription, "xhigh", "deep"))).toEqual({
     thinking: "xhigh", outputBudget: 128000, reasoningBudget: null, options: { reasoning: "xhigh" } });
   expect(sideThinkingOptions(subscription, "off", "quick")).toEqual({ ok: false, reason: "reasoning_policy_unsupported" });
+});
+
+test("Codex quick policy is supported without a fake wire ceiling", () => {
+  const model = { id: "gpt-6.1-sol", api: "openai-codex-responses", reasoning: true, maxTokens: 32000,
+    thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" } };
+  const before = structuredClone(model);
+  expect(value(sideThinkingOptions(model, "high", "quick"))).toEqual({
+    thinking: "low", outputBudget: 4096, reasoningBudget: null, options: { reasoningEffort: "low" },
+  });
+  expect(value(sideThinkingOptions({ ...model, maxTokens: 2000 }, "high", "quick")).outputBudget).toBe(2000);
+  expect(sideThinkingOptions({ ...model, thinkingLevelMap: { ...model.thinkingLevelMap, low: null } },
+    "high", "quick")).toEqual({ ok: false, reason: "reasoning_policy_unsupported" });
+  expect(value(sideThinkingOptions({ ...model, reasoning: false }, "high", "quick")).options).toEqual({});
+  for (const level of ["off", "minimal"]) {
+    expect(sideThinkingOptions(model, level, "quick")).toEqual({ ok: false, reason: "reasoning_policy_unsupported" });
+  }
+  // Deep behaviour is unchanged from the base code captured in task-1/deep-before.txt.
+  expect(value(sideThinkingOptions(model, "high", "deep"))).toEqual({
+    thinking: "high", outputBudget: 32000, reasoningBudget: null, options: { maxTokens: 32000, reasoningEffort: "high" },
+  });
+  expect(model).toEqual(before);
+});
+
+test("Codex quick verifies low tool-free standard-tier SSE payload after transforms", async () => {
+  const model = { id: "gpt-6.1-sol", provider: "chatgpt-subscription", api: "openai-codex-responses",
+    reasoning: true, contextWindow: 500000, maxTokens: 32000,
+    thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" } };
+  const mainOptions = { reasoning: "xhigh", streamKind: "main", serviceTier: "priority" };
+  const savedModel = structuredClone(model), savedOptions = structuredClone(mainOptions);
+  const hostile = { model: "gpt-6.1-sol", input: [{ role: "user", content: "nonce" }],
+    reasoning: { effort: "high" }, tools: [{ type: "function", name: "bash" }], tool_choice: "auto",
+    max_output_tokens: 99999, max_tokens: 99999, service_tier: "priority" };
+  const f = fixture();
+  async function runCase(transform: (body: Json) => Json) {
+    let streamCalls = 0, options: any;
+    let payload: Promise<Json> | undefined;
+    const sent: Json[] = [], seenPayloads: Json[] = [];
+    const runtime: any = {
+      sessionId: "main-session", thinkingLevel: "xhigh", messages: [], _pendingNextTurnMessages: [],
+      sessionManager: { getBranch: () => [{ id: "base" }] },
+      sendCustomMessage() {},
+      agent: { state: { tools: [{ name: "bash", description: "shell", parameters: {} }] },
+        convertToLlm: async (messages: unknown[]) => messages },
+      extensionRunner: { createContext: () => ({
+        prepareProviderRequest: async (messages: unknown[]) => ({ messages,
+          transformHeaders: async (headers: unknown) => headers,
+          transformPayload: async (body: Json) => transform(body) }),
+      }) },
+      modelRuntime: {
+        getCompatibilityRequestConfig: () => ({}),
+        prepareSimpleRequest: async () => ({ model, options: structuredClone(mainOptions) }),
+        stream(_model: unknown, _context: unknown, streamOptions: any) {
+          streamCalls++; options = streamOptions;
+          const first = streamOptions.onPayload(hostile).then((result: Json) => { sent.push(result); return result; });
+          payload = first;
+          first.catch(() => {});
+          return { async *[Symbol.asyncIterator]() {}, result: () => new Promise(() => {}) };
+        },
+      },
+    };
+    const capture: any = {
+      runtime: () => runtime,
+      read: () => ({ ok: true, value: { revision: 1, observed_at: new Date(1000).toISOString(), branch: "base",
+        model, system_prompt: "Unit Codex context", messages: [], model_runtime: runtime.modelRuntime } }),
+    };
+    const adapter = nativeQuestionTarget({ binding: f.a.binding, capture,
+      validate: () => ({ ok: true, value: undefined }), subscribe: () => () => {},
+      onPayload: (_snapshot, body) => { seenPayloads.push(body); } });
+    const prepared = value(await adapter.prepare(value(adapter.read()), "Return nonce", [], "quick",
+      new AbortController().signal));
+    void prepared.run().catch(() => {});
+    if (!payload) throw new Error("payload hook was not invoked");
+    let settled: { ok: true; body: Json } | { ok: false; error: unknown };
+    try { settled = { ok: true, body: await payload }; } catch (error) { settled = { ok: false, error }; }
+    return { prepared, settled, options, sent, seenPayloads, streamCalls, runtime };
+  }
+
+  const admitted = await runCase((body) => body);
+  if (!admitted.settled.ok) throw admitted.settled.error;
+  const body = admitted.settled.body;
+  expect(admitted.prepared.thinking).toBe("low");
+  expect(admitted.prepared.attempts).toBe(1);
+  expect(body.reasoning).toEqual({ effort: "low" });
+  for (const key of ["tools", "tool_choice", "max_output_tokens", "max_tokens", "max_completion_tokens", "service_tier"]) {
+    expect(Object.hasOwn(body, key)).toBe(false);
+  }
+  expect(admitted.options).toMatchObject({ transport: "sse", maxRetries: 0 });
+  expect(admitted.prepared.controls).toMatchObject({
+    wire_output_budget: null, output_cap: "client_abort", output_cap_scope: "visible_text",
+    client_output_limit_utf8_bytes: 4096, lane_internal_retry: "possible",
+    physical_attempts_basis: "payload_hook", physical_attempts_wire_verified: false,
+    wire_reasoning_effort: "low", requested_service_tier: "priority", wire_service_tier: null,
+  });
+  expect(admitted.seenPayloads).toEqual([body]);
+  expect(admitted.sent).toEqual([body]);
+  const second = admitted.options.onPayload(hostile) as Promise<Json>;
+  expect(await second.then(() => "resolved", (error: Error) => error.message)).toBe("provider_failure");
+  expect(admitted.prepared.attempts).toBe(1);
+  expect(admitted.runtime.thinkingLevel).toBe("xhigh");
+  expect(model).toEqual(savedModel);
+  expect(mainOptions).toEqual(savedOptions);
+
+  const refusals: [string, (body: Json) => Json][] = [
+    ["transformed thinking.enabled", (candidate) => ({ ...candidate, thinking: { type: "enabled" } })],
+    ["oversized reasoning budget", (candidate) => ({ ...candidate, reasoning_budget_tokens: 999999 })],
+    ["non-numeric reasoning budget", (candidate) => ({ ...candidate, reasoning_budget_tokens: "many" })],
+  ];
+  for (const [label, transform] of refusals) {
+    const refused = await runCase(transform);
+    if (refused.settled.ok) throw new Error(`${label} was admitted`);
+    expect(String((refused.settled.error as Error)?.message ?? refused.settled.error)).toBe("reasoning_policy_unsupported");
+    expect(refused.prepared.attempts).toBe(0);
+    expect(refused.seenPayloads).toHaveLength(0);
+    expect(refused.sent).toHaveLength(0);
+    expect(refused.streamCalls).toBe(1);
+  }
+
+  const overwritten = await runCase((candidate) => ({ ...candidate,
+    reasoning: { ...candidate.reasoning, effort: "high" } }));
+  if (!overwritten.settled.ok) throw overwritten.settled.error;
+  expect(overwritten.settled.body.reasoning).toEqual({ effort: "low" });
+  expect(overwritten.prepared.controls.wire_reasoning_effort).toBe("low");
+  expect(overwritten.prepared.attempts).toBe(1);
+  f.q.dispose();
+});
+
+function hasLoneSurrogate(text: string) {
+  for (let index = 0; index < text.length; index++) {
+    const code = text.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = text.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) { index++; continue; }
+      return true;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
+}
+
+async function runCodexQuickStream(testCase: { events: readonly Json[]; content: readonly Json[];
+  maxTokens?: number; stopReason?: string; caller?: AbortController; usage?: Json }) {
+  const f = fixture();
+  const model = { id: "gpt-6.1-sol", provider: "chatgpt-subscription", api: "openai-codex-responses",
+    reasoning: true, contextWindow: 500000, maxTokens: testCase.maxTokens ?? 32000,
+    thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" } };
+  let seen: { context: Json; options: Json } | undefined, calls = 0, drained = false;
+  const runtime: any = {
+    sessionId: "main-session", thinkingLevel: "high", messages: [], _pendingNextTurnMessages: [],
+    sessionManager: { getBranch: () => [{ id: "base" }] },
+    sendCustomMessage() {},
+    agent: { state: { tools: [] }, convertToLlm: async (messages: unknown[]) => messages },
+    extensionRunner: { createContext: () => ({
+      prepareProviderRequest: async (messages: unknown[]) => ({ messages,
+        transformHeaders: async (headers: unknown) => headers, transformPayload: async (body: unknown) => body }),
+    }) },
+    modelRuntime: {
+      getCompatibilityRequestConfig: () => ({}),
+      prepareSimpleRequest: async () => ({ model, options: {} }),
+      stream(_model: unknown, context: Json, streamOptions: Json) {
+        calls++; seen = { context, options: streamOptions };
+        return {
+          async *[Symbol.asyncIterator]() {
+            for (const event of testCase.events) yield event;
+            drained = true;
+          },
+          result: () => Promise.resolve({
+            stopReason: (streamOptions.signal as AbortSignal).aborted ? "aborted" : testCase.stopReason ?? "stop",
+            content: testCase.content,
+            usage: testCase.usage ?? { input: 0, output: 0, reasoning: 0, cacheRead: 0, totalTokens: 0 },
+          }),
+        };
+      },
+    },
+  };
+  const capture: any = { runtime: () => runtime, read: () => ({ ok: true, value: {
+    revision: 1, observed_at: new Date(1000).toISOString(), branch: "base", model,
+    system_prompt: "Unit Codex stream context", messages: [], model_runtime: runtime.modelRuntime } }) };
+  const adapter = nativeQuestionTarget({ binding: f.a.binding, capture,
+    validate: () => ({ ok: true, value: undefined }), subscribe: () => () => {} });
+  const caller = testCase.caller ?? new AbortController();
+  const prepared = value(await adapter.prepare(value(adapter.read()), "Return nonce", [], "quick", caller.signal));
+  const reply = await prepared.run();
+  f.q.dispose();
+  if (!seen) throw new Error("stream was not called");
+  return { reply, caller, seen, calls, drained: () => drained };
+}
+
+test("Codex quick caps streamed UTF8 without corrupting code points", async () => {
+  const delta = (contentIndex: number, value: string) => ({ type: "text_delta", contentIndex, delta: value });
+  const block = (value: string) => [{ type: "text", text: value }];
+  const nullUsage = { input: null, output: null, reasoning: null, cache: null };
+
+  const under = await runCodexQuickStream({ events: [delta(0, "짧은 "), delta(0, "답")], content: block("짧은 답") });
+  expect(under.reply).toMatchObject({ text: "짧은 답", completion: "complete" });
+  expect(under.caller.signal.aborted).toBe(false);
+
+  // Exactly at the cap with a normal end stays complete.
+  const exact = await runCodexQuickStream({ maxTokens: 2000, events: [delta(0, "a".repeat(2000))],
+    content: block("a".repeat(2000)) });
+  expect(exact.reply).toMatchObject({ completion: "complete", text: "a".repeat(2000) });
+  expect(Buffer.byteLength(exact.reply.text)).toBe(2000);
+  expect((exact.seen.options.signal as AbortSignal).aborted).toBe(false);
+
+  // Over the cap: keep the longest whole-code-point prefix, drain but ignore later deltas.
+  const over = await runCodexQuickStream({ events: [delta(0, "a".repeat(4096)), delta(0, "IGNORED"),
+    delta(0, "b")], content: block("a".repeat(4098)) });
+  expect(over.reply).toMatchObject({ completion: "truncated_by_client", text: "a".repeat(4096), usage: nullUsage });
+  expect((over.seen.options.signal as AbortSignal).aborted).toBe(true);
+  expect(over.caller.signal.aborted).toBe(false);
+  expect(over.drained()).toBe(true);
+
+  // Korean code points are 3 bytes: 1365 fit, the 1366th would overflow.
+  const korean = await runCodexQuickStream({ events: [delta(0, "한".repeat(2000))],
+    content: block("한".repeat(2000)) });
+  expect(korean.reply.completion).toBe("truncated_by_client");
+  expect(korean.reply.text).toBe("한".repeat(1365));
+  expect(Buffer.byteLength(korean.reply.text)).toBe(4095);
+  expect(hasLoneSurrogate(korean.reply.text)).toBe(false);
+
+  // 4-byte characters: a surrogate pair split across deltas reaches exactly 4096 bytes.
+  const split = await runCodexQuickStream({ events: [delta(0, "😀".repeat(1023)), delta(0, "\uD83D"),
+    delta(0, "\uDE00")], content: block("😀".repeat(1024)) });
+  expect(split.reply).toMatchObject({ completion: "complete", text: "😀".repeat(1024) });
+  expect(Buffer.byteLength(split.reply.text)).toBe(4096);
+  expect(hasLoneSurrogate(split.reply.text)).toBe(false);
+
+  const emoji = await runCodexQuickStream({ events: [delta(0, "😀".repeat(1025))],
+    content: block("😀".repeat(1025)) });
+  expect(emoji.reply.completion).toBe("truncated_by_client");
+  expect(emoji.reply.text).toBe("😀".repeat(1024));
+  expect(Buffer.byteLength(emoji.reply.text)).toBe(4096);
+  expect(hasLoneSurrogate(emoji.reply.text)).toBe(false);
+  expect(emoji.reply).toMatchObject({ usage: nullUsage });
+
+  // Thinking payloads never count toward the visible-text cap.
+  const thinking = await runCodexQuickStream({ events: [
+    { type: "thinking_delta", contentIndex: 0, delta: "y".repeat(10000) },
+    { type: "thinking_end", contentIndex: 0, content: "x".repeat(10000) },
+    delta(0, "ok")], content: block("ok") });
+  expect(thinking.reply).toMatchObject({ text: "ok", completion: "complete" });
+});
+
+test("Codex quick caps text_end and final-only replies", async () => {
+  const delta = (contentIndex: number, value: string) => ({ type: "text_delta", contentIndex, delta: value });
+  const end = (contentIndex: number, content: string) => ({ type: "text_end", contentIndex, content });
+  const block = (value: string) => [{ type: "text", text: value }];
+  const nullUsage = { input: null, output: null, reasoning: null, cache: null };
+
+  // A text_end replaces the block text it supersedes.
+  const replaced = await runCodexQuickStream({ events: [delta(0, "wrong"), end(0, "right")], content: block("right") });
+  expect(replaced.reply).toMatchObject({ text: "right", completion: "complete" });
+
+  // A text_end larger than the cap with no deltas is cut code-point safely.
+  const endOver = await runCodexQuickStream({ events: [end(0, "가".repeat(2000))], content: block("가".repeat(2000)) });
+  expect(endOver.reply).toMatchObject({ completion: "truncated_by_client", text: "가".repeat(1365), usage: nullUsage });
+  expect((endOver.seen.options.signal as AbortSignal).aborted).toBe(true);
+
+  // Final-only replies with no events at all are capped the same way.
+  const finalOnly = await runCodexQuickStream({ events: [], content: block("나".repeat(2000)) });
+  expect(finalOnly.reply).toMatchObject({ completion: "truncated_by_client", text: "나".repeat(1365), usage: nullUsage });
+  expect(hasLoneSurrogate(finalOnly.reply.text)).toBe(false);
+
+  // Two text blocks are joined with a newline exactly like the normal return path.
+  const two = await runCodexQuickStream({ events: [delta(0, "left"), delta(1, "right")],
+    content: [{ type: "text", text: "left" }, { type: "text", text: "right" }] });
+  expect(two.reply).toMatchObject({ text: "left\nright", completion: "complete" });
+});
+
+type Pending<T> = { promise: Promise<T>; resolve(value: T): void; reject(reason: unknown): void };
+type CodexStream = (model: Json, context: Json, options: Json) => AsyncIterable<Json> & { result(): Promise<Json> };
+
+const codexQuickModel = (): Json => ({ id: "gpt-6.1-sol", provider: "chatgpt-subscription",
+  api: "openai-codex-responses", reasoning: true, contextWindow: 500000, maxTokens: 32000, input: ["text"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" } });
+
+/** A structurally valid JWT carrying the claim the real provider reads; it is never a credential. */
+function fakeCodexJwt(): string {
+  const encode = (value: Json) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  return [encode({ alg: "none", typ: "JWT" }),
+    encode({ "https://api.openai.com/auth": { chatgpt_account_id: "acct_test" } }), "signature"].join(".");
+}
+
+async function loadCodexProviderStream(): Promise<CodexStream> {
+  const entry = "file:///C:/Users/USER/.bun/install/global/node_modules/@earendil-works/pi-ai/dist/api/openai-codex-responses.js";
+  const loaded = await import(entry) as { stream: CodexStream };
+  return loaded.stream;
+}
+
+/** Drives one Codex quick ask through the real ledger and native target with an injected clock. */
+function codexAskHarness(stream: CodexStream, options: { apiKey?: string; model?: Json } = {}) {
+  let clock = 1000;
+  const timers = new Set<{ at: number; callback(): void }>();
+  const model = options.model ?? codexQuickModel();
+  const streamCalls: Json[] = [], queued: Json[] = [];
+  const caller = { kind: "root", target_ref: "coordination:root", owner_root_id: "owner",
+    owner_session_id: "owner", canonical_session_id: "root", session_id: "root",
+    runtime_instance_id: "root", generation: 1, branch: "base" } as TargetBinding;
+  const target = { kind: "worker", target_ref: "coordination:a", owner_root_id: "owner",
+    owner_session_id: "owner", canonical_session_id: "a", session_id: "a",
+    runtime_instance_id: "a", generation: 1, task_id: "a", run_epoch: 1 } as TargetBinding;
+  const runtime: Json = {
+    sessionId: "main-session", thinkingLevel: "high", messages: [], _pendingNextTurnMessages: [],
+    sessionManager: { getBranch: () => [{ id: "base" }] },
+    async sendCustomMessage(message: Json) { queued.push(message); },
+    agent: { state: { tools: [] }, convertToLlm: async (messages: unknown[]) => messages },
+    extensionRunner: { createContext: () => ({
+      prepareProviderRequest: async (messages: unknown[]) => ({ messages,
+        transformHeaders: async (headers: unknown) => headers,
+        transformPayload: async (body: unknown) => body }),
+    }) },
+    modelRuntime: {
+      getCompatibilityRequestConfig: () => ({}),
+      prepareSimpleRequest: async () => ({ model, options: { apiKey: options.apiKey ?? "unit-api-key" } }),
+      stream(_streamModel: Json, context: Json, streamOptions: Json) {
+        streamCalls.push(streamOptions);
+        return stream(model, context, streamOptions);
+      },
+    },
+  };
+  const capture: Json = { runtime: () => runtime, read: () => ({ ok: true, value: {
+    revision: 1, observed_at: new Date(clock).toISOString(), branch: "base", model,
+    system_prompt: "Unit Codex ask context", messages: [], model_runtime: runtime.modelRuntime } }) };
+  const adapter = nativeQuestionTarget({ binding: target, capture: capture as any,
+    validate: () => ({ ok: true, value: undefined }), subscribe: () => () => {} });
+  const callerAdapter = { binding: caller, read: () => ({ ok: true, value: {
+      revision: 1, at: new Date(clock).toISOString(), branch: "base", model, thinking: "high",
+      context: { messages: [] } } }),
+    prepare() { throw new Error("the caller is not a target"); }, async queue() {}, remove() {},
+    consumed: () => false, subscribe: () => () => {} } as QuestionTarget;
+  const q = createPeerQuestions({ generation: 1, now: () => clock,
+    schedule(ms, callback) {
+      const timer = { at: clock + ms, callback };
+      timers.add(timer);
+      return () => { timers.delete(timer); };
+    },
+    resolve(binding) {
+      return binding.target_ref === target.target_ref
+        ? { ok: true, value: adapter } : { ok: true, value: callerAdapter };
+    } });
+  return {
+    q, streamCalls, queued, model,
+    ask: (id: string, extra: Json = {}) => q.ask(caller, target,
+      { target_ref: target.target_ref, question: "Return nonce", request_id: id, ...extra } as any),
+    advance(ms: number, fire = true) {
+      clock += ms;
+      if (fire) for (const timer of [...timers]) if (timer.at <= clock) { timers.delete(timer); timer.callback(); }
+    },
+    dispose() { q.dispose(); },
+  };
+}
+
+/** One armed fake provider stream per ask: events, a late reply promise, and its abort signal. */
+function codexStreamControl() {
+  type Scenario = { events: readonly Json[]; waitForAbort: boolean; reply: Pending<Json>;
+    started: Pending<void>; aborted: Pending<void>; signal?: AbortSignal };
+  let current: Scenario | undefined;
+  return {
+    begin(events: readonly Json[], waitForAbort = true): Scenario {
+      current = { events, waitForAbort, reply: deferred<Json>(), started: deferred<void>(), aborted: deferred<void>() };
+      return current;
+    },
+    stream: ((_model, _context, streamOptions) => {
+      if (!current) throw new Error("no Codex stream scenario was armed");
+      const scenario = current;
+      const signal = streamOptions.signal as AbortSignal;
+      scenario.signal = signal;
+      const abort = () => scenario.aborted.resolve();
+      if (signal.aborted) abort(); else signal.addEventListener("abort", abort, { once: true });
+      scenario.started.resolve();
+      return {
+        async *[Symbol.asyncIterator]() {
+          for (const event of scenario.events) yield event;
+          if (scenario.waitForAbort) await scenario.aborted.promise;
+        },
+        result: () => scenario.reply.promise,
+      };
+    }) as CodexStream,
+  };
+}
+
+test("Codex quick cancellation and deadline beat local truncation", async () => {
+  const control = codexStreamControl();
+  const h = codexAskHarness(control.stream);
+  const quiet = () => {
+    expect(h.q.diagnostics()).toMatchObject({ active: 0, pending: 0, pending_bytes: 0 });
+    expect(h.queued).toHaveLength(0);
+  };
+
+  // An already-aborted caller never reaches preparation or the provider.
+  const pre = new AbortController();
+  pre.abort();
+  expect(await h.ask("pre-aborted", { signal: pre.signal })).toEqual({ ok: false, reason: "asker_aborted" });
+  expect(h.streamCalls).toHaveLength(0);
+
+  // A caller cancel before any cap wins the terminal.
+  const before = new AbortController();
+  const beforeState = control.begin([{ type: "text_delta", contentIndex: 0, delta: "under" }]);
+  const pendingBefore = h.ask("cancel-before", { signal: before.signal });
+  await beforeState.started.promise;
+  before.abort();
+  await beforeState.aborted.promise;
+  expect(beforeState.signal?.aborted).toBe(true);
+  beforeState.reply.resolve({ stopReason: "aborted", content: [{ type: "text", text: "under" }],
+    usage: { input: 1, output: 1 } });
+  const cancelledBefore = value(await pendingBefore);
+  expect(cancelledBefore).toMatchObject({ state: "cancelled", ended_by: "asker_aborted" });
+  expect(cancelledBefore.completion).toBeUndefined();
+  expect(cancelledBefore.reply).toBeUndefined();
+  quiet();
+
+  // A caller cancel after the local cap fired still ends as the caller's cancel.
+  const after = new AbortController();
+  const afterState = control.begin([
+    { type: "text_delta", contentIndex: 0, delta: "a".repeat(4096) },
+    { type: "text_delta", contentIndex: 0, delta: "overflow" },
+  ]);
+  const pendingAfter = h.ask("cancel-after", { signal: after.signal });
+  await afterState.started.promise;
+  await afterState.aborted.promise;
+  expect(afterState.signal?.aborted).toBe(true);
+  after.abort();
+  afterState.reply.resolve({ stopReason: "aborted", content: [{ type: "text", text: "a".repeat(4096) }],
+    usage: { input: 1, output: 1 } });
+  const cancelledAfter = value(await pendingAfter);
+  expect(cancelledAfter).toMatchObject({ state: "cancelled", ended_by: "asker_aborted" });
+  expect(cancelledAfter.completion).not.toBe("truncated_by_client");
+  expect(cancelledAfter.reply).toBeUndefined();
+  quiet();
+
+  // Reasoning-only output never counts toward the cap; the quick deadline ends it.
+  const reasoningState = control.begin([
+    { type: "thinking_delta", contentIndex: 0, delta: "r".repeat(20000) },
+    { type: "thinking_end", contentIndex: 0, content: "r".repeat(20000) },
+  ]);
+  const reasoning = h.ask("reasoning-deadline", { timeout_ms: 100 });
+  await reasoningState.started.promise;
+  h.advance(101);
+  reasoningState.reply.resolve({ stopReason: "aborted",
+    content: [{ type: "thinking", thinking: "r".repeat(20000) }], usage: { input: 1, output: 1 } });
+  const timedOut = value(await reasoning);
+  expect(timedOut).toMatchObject({ state: "timed_out" });
+  expect(timedOut.completion).toBeUndefined();
+  expect(timedOut.reply).toBeUndefined();
+  quiet();
+
+  // A timer that fires after the absolute deadline cannot admit the late reply.
+  const lateState = control.begin([], false);
+  const late = h.ask("late-reply", { timeout_ms: 100 });
+  await lateState.started.promise;
+  h.advance(101, false);
+  lateState.reply.resolve({ stopReason: "stop", content: [{ type: "text", text: "late" }],
+    usage: { input: 1, output: 1 } });
+  const lateResult = value(await late);
+  expect(lateResult).toMatchObject({ state: "timed_out" });
+  expect(lateResult.completion).toBeUndefined();
+  expect(lateResult.reply).toBeUndefined();
+  quiet();
+
+  h.dispose();
+  expect(h.q.diagnostics()).toMatchObject({ active: 0, pending: 0 });
+});
+
+test("Codex quick provider failures do not retry or fall back", async () => {
+  const model = codexQuickModel(), apiKey = fakeCodexJwt();
+  const provider = await loadCodexProviderStream();
+  const originalFetch = globalThis.fetch, originalWebSocket = globalThis.WebSocket;
+  const failures: readonly [string, () => Response][] = [
+    ["429", () => new Response("rate limited", { status: 429, headers: { "retry-after-ms": "0" } })],
+    ["503", () => new Response("service unavailable", { status: 503 })],
+    ["network throw", () => { throw new TypeError("unit network failure"); }],
+  ];
+  try {
+    for (const [label, respond] of failures) {
+      const requests: { url: string; init: any }[] = [];
+      let webSockets = 0;
+      globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        requests.push({ url: String(input), init });
+        return respond();
+      }) as typeof fetch;
+      globalThis.WebSocket = class {
+        constructor() { webSockets++; throw new Error("WEBSOCKET_CONSTRUCTED"); }
+      } as unknown as typeof WebSocket;
+      const h = codexAskHarness((streamModel, context, streamOptions) =>
+        provider(streamModel, context, streamOptions), { model, apiKey });
+      const result = value(await h.ask(`failure-${label}`));
+      expect(result).toMatchObject({ state: "failed", terminal_reason: "provider_failure",
+        ended_by: "provider_failure", physical_provider_attempts: 1 });
+      expect(result.completion).toBeUndefined();
+      expect(requests).toHaveLength(1);
+      expect(webSockets).toBe(0);
+      expect(requests[0]?.url).toBe("https://chatgpt.com/backend-api/codex/responses");
+      expect(requests[0]?.init?.method).toBe("POST");
+      expect(new Headers(requests[0]?.init?.headers).get("chatgpt-account-id")).toBe("acct_test");
+      expect(h.streamCalls).toHaveLength(1);
+      expect(h.streamCalls[0]?.apiKey).toBe(apiKey);
+      expect(h.streamCalls[0]).toMatchObject({ transport: "sse", maxRetries: 0 });
+      h.dispose();
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.WebSocket = originalWebSocket;
+  }
+});
+
+test("Codex quick cap holds on the real pi-ai SSE parser", async () => {
+  const model = codexQuickModel(), apiKey = fakeCodexJwt();
+  const provider = await loadCodexProviderStream();
+  const cap = 4096;
+  // 1365 Korean code points fill 4095 bytes; the next one cannot fit and must be dropped whole.
+  const head = "가".repeat(1365);
+  const fullText = `${head}가${"나".repeat(10)}`;
+  const events: Json[] = [
+    { type: "response.created", response: { id: "resp_unit" } },
+    { type: "response.output_item.added", output_index: 0,
+      item: { type: "message", id: "msg_unit", role: "assistant", status: "in_progress", content: [] } },
+    { type: "response.output_text.delta", output_index: 0, item_id: "msg_unit", content_index: 0, delta: head },
+    { type: "response.output_text.delta", output_index: 0, item_id: "msg_unit", content_index: 0, delta: "가" },
+    { type: "response.output_text.delta", output_index: 0, item_id: "msg_unit", content_index: 0,
+      delta: "나".repeat(10) },
+    { type: "response.output_item.done", output_index: 0, item: { type: "message", id: "msg_unit",
+      role: "assistant", status: "completed",
+      content: [{ type: "output_text", text: fullText, annotations: [] }] } },
+    { type: "response.completed", response: { id: "resp_unit", status: "completed", output: [],
+      usage: { input_tokens: 11, output_tokens: 22, total_tokens: 33 } } },
+  ];
+  const sse = events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
+  const requests: { url: string; init: any }[] = [];
+  const originalFetch = globalThis.fetch, originalWebSocket = globalThis.WebSocket;
+  try {
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      requests.push({ url: String(input), init });
+      return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    globalThis.WebSocket = class {
+      constructor() { throw new Error("WEBSOCKET_CONSTRUCTED"); }
+    } as unknown as typeof WebSocket;
+    const h = codexAskHarness((streamModel, context, streamOptions) =>
+      provider(streamModel, context, streamOptions), { model, apiKey });
+    const result = value(await h.ask("real-sse-cap"));
+    expect(result).toMatchObject({ state: "replied", completion: "truncated_by_client",
+      physical_provider_attempts: 1,
+      usage: { input: null, output: null, reasoning: null, cache: null } });
+    const reply = result.reply;
+    if (reply === undefined) throw new Error("expected a capped reply");
+    expect(reply).toBe(head);
+    expect(Buffer.byteLength(reply)).toBeLessThanOrEqual(cap);
+    expect(hasLoneSurrogate(reply)).toBe(false);
+    expect(requests).toHaveLength(1);
+    expect(h.streamCalls).toHaveLength(1);
+    h.dispose();
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.WebSocket = originalWebSocket;
+  }
 });
 
 test("the Claude subscription lane runs one tool-less low-effort side query and caps the visible reply on the stream", async () => {

@@ -402,12 +402,12 @@ export function sideThinkingOptions(model: Json, before: string, depth: Depth): 
   thinking: string; outputBudget: number; reasoningBudget: number | null; options: Json;
 }> {
   if (!levels.includes(before) || !(model.maxTokens > 0)) return refuse("reasoning_policy_unsupported");
-  // The pinned Codex buildRequestBody has no output-token ceiling. A fabricated
-  // max_tokens field is not an enforceable quick cap on that native route.
-  if (model.api === "openai-codex-responses" && depth === "quick") return refuse("reasoning_policy_unsupported");
   const thinking = depth === "deep" ? before : levels.indexOf(before) > 2 ? "low" : before;
   const outputBudget = depth === "deep" ? model.maxTokens : Math.min(model.maxTokens, LIMITS.quick_output_tokens);
   if (model.reasoning && model.thinkingLevelMap?.[thinking] === null) return refuse("reasoning_policy_unsupported");
+  // The Codex body carries no output ceiling; nativeQuestionTarget enforces the cap on the stream instead.
+  if (model.api === "openai-codex-responses" && depth === "quick") return { ok: true, value: { thinking, outputBudget,
+    reasoningBudget: null, options: model.reasoning ? { reasoningEffort: thinking === "off" ? "none" : thinking } : {} } };
   if (String(model.api).startsWith("openai-") || model.api === "azure-openai-responses") {
     return { ok: true, value: { thinking, outputBudget, reasoningBudget: null,
       options: { maxTokens: outputBudget, ...(model.reasoning && thinking !== "off" ? { reasoningEffort: thinking } : {}) } } };
@@ -581,8 +581,19 @@ export function nativeQuestionTarget(options: {
         async run() {
           signal.throwIfAborted();
           if (snapshot.model.api === "claude-sdk-oauth") return runSdkLane();
-          const stream = runtime!.modelRuntime.stream(snapshot.model, context, {
-            ...auth.options, ...thinking.value.options, headers, maxRetries: 0, signal,
+          const codexQuick = snapshot.model.api === "openai-codex-responses" && depth === "quick";
+          // A private controller forwards a caller cancel; a local output cap never
+          // reaches the caller's signal (or the root's main turn).
+          const stop = codexQuick ? new AbortController() : undefined;
+          const forward = () => stop!.abort(signal.reason);
+          if (stop) {
+            if (signal.aborted) forward();
+            else signal.addEventListener("abort", forward, { once: true });
+          }
+          try {
+            const stream = runtime!.modelRuntime.stream(snapshot.model, context, {
+            ...auth.options, ...thinking.value.options, headers, maxRetries: 0,
+            signal: stop?.signal ?? signal,
             toolChoice: "none",
             ...(snapshot.model.api === "openai-codex-responses" ? { transport: "sse" } : {}),
             extraBody: config.extraBody,
@@ -594,6 +605,38 @@ export function nativeQuestionTarget(options: {
             onPayload: async (payload: Json) => {
               if (attempts !== 0) throw new Error("provider_failure");
               const body = structuredClone(await prepared.transformPayload(payload)) as Json;
+              if (codexQuick) {
+                const mapped = snapshot.model.thinkingLevelMap?.[thinking.value.thinking] ?? thinking.value.thinking;
+                if (snapshot.model.reasoning) body.reasoning = { ...(body.reasoning ?? {}),
+                  effort: thinking.value.thinking === "off" ? "none" : mapped };
+                controls.requested_service_tier = body.service_tier ?? null;
+                delete body.service_tier;
+                delete body.tools; delete body.tool_choice;
+                delete body.max_output_tokens; delete body.max_tokens; delete body.max_completion_tokens;
+                const wireEffort = body.reasoning?.effort ?? body.reasoning_effort ?? body.output_config?.effort;
+                const explicitBudgets = ["thinking_token_budget", "thinking_budget", "thinking_budget_tokens",
+                  "thinkingBudgetTokens", "reasoning_budget", "reasoning_budget_tokens"].map((key) => body[key])
+                  .filter((value) => value !== undefined);
+                if (["max_output_tokens", "max_tokens", "max_completion_tokens", "service_tier", "tools", "tool_choice"]
+                    .some((key) => key in body) ||
+                    (wireEffort !== undefined && !["none", "off", "minimal", "low"].includes(wireEffort)) ||
+                    explicitBudgets.some((value) => typeof value !== "number" || value > LIMITS.quick_reasoning_tokens) ||
+                    body.thinking?.type === "enabled") {
+                  policyRefused = true; throw new Error("reasoning_policy_unsupported");
+                }
+                controls.wire_output_budget = null;
+                controls.output_cap = "client_abort";
+                controls.output_cap_scope = "visible_text";
+                controls.client_output_limit_utf8_bytes = thinking.value.outputBudget;
+                controls.lane_internal_retry = "possible";
+                controls.physical_attempts_basis = "payload_hook";
+                controls.physical_attempts_wire_verified = false;
+                controls.wire_reasoning_effort = typeof wireEffort === "string" ? wireEffort : null;
+                controls.wire_service_tier = null;
+                attempts++;
+                options.onPayload?.(snapshot, body);
+                return body;
+              }
               if (depth === "quick") {
                 if (anthropic) {
                   body.thinking = { type: "disabled" };
@@ -647,23 +690,94 @@ export function nativeQuestionTarget(options: {
               return body;
             },
           });
-          const message = await stream.result();
-          signal.throwIfAborted();
-          if (message.stopReason === "error" || message.stopReason === "aborted") {
-            options.onFailure?.({ model: `${auth.model.provider}/${auth.model.id}`, api: auth.model.api,
-              status: responseStatus, error: String(message.errorMessage ?? message.stopReason)
-                .replace(/Bearer\s+\S+|sk-[A-Za-z0-9_-]+/g, "[redacted]") });
-            throw new Error(policyRefused ? "reasoning_policy_unsupported" : "provider_failure");
+            if (codexQuick) {
+              // pi-ai may stream deltas, replace a block at text_end, or only send the
+              // final message. Count the joined visible text, never thinking payloads.
+              const limit = thinking.value.outputBudget;
+              const blocks = new Map<number, string>();
+              const prefix = (value: string) => {
+                let text = "", bytes = 0;
+                for (const char of value) {
+                  const size = Buffer.byteLength(char);
+                  if (bytes + size > limit) break;
+                  text += char; bytes += size;
+                }
+                return text;
+              };
+              const joined = () => [...blocks.entries()].sort(([left], [right]) => left - right)
+                .map(([, block]) => block).join("\n");
+              let pendingHigh = "", cappedText: string | null = null;
+              for await (const event of stream as AsyncIterable<Json>) {
+                if (cappedText !== null) continue;
+                const index = Number(event.contentIndex ?? 0);
+                if (event.type === "text_end") {
+                  pendingHigh = "";
+                  blocks.set(index, String(event.content ?? ""));
+                } else if (event.type === "text_delta") {
+                  const delta = pendingHigh + String(event.delta ?? "");
+                  pendingHigh = "";
+                  let body = delta;
+                  const last = delta.charCodeAt(delta.length - 1);
+                  // Hold a high surrogate until the next delta supplies its low half.
+                  if (delta && last >= 0xd800 && last <= 0xdbff) {
+                    pendingHigh = delta.slice(-1);
+                    body = delta.slice(0, -1);
+                  }
+                  if (body) blocks.set(index, (blocks.get(index) ?? "") + body);
+                } else continue;
+                const text = joined();
+                if (Buffer.byteLength(text) <= limit) continue;
+                cappedText = prefix(text);
+                stop!.abort("output_cap");
+              }
+              const message = await stream.result();
+              signal.throwIfAborted();
+              const content = (message.content ?? []).filter((part: Json) => part.type === "text")
+                .map((part: Json) => part.text).join("\n");
+              const toolCalls = (message.content ?? []).some((part: Json) => part.type === "toolCall");
+              if (cappedText !== null) {
+                return { text: cappedText, toolCalls, completion: "truncated_by_client" as const,
+                  usage: emptyUsage(), attempts };
+              }
+              if (message.stopReason === "error" || message.stopReason === "aborted") {
+                options.onFailure?.({ model: `${auth.model.provider}/${auth.model.id}`, api: auth.model.api,
+                  status: responseStatus, error: String(message.errorMessage ?? message.stopReason)
+                    .replace(/Bearer\s+\S+|sk-[A-Za-z0-9_-]+/g, "[redacted]") });
+                throw new Error(policyRefused ? "reasoning_policy_unsupported" : "provider_failure");
+              }
+              const cut = Buffer.byteLength(content) > limit ? prefix(content) : null;
+              return {
+                text: cut ?? content,
+                toolCalls,
+                completion: cut !== null ? "truncated_by_client" as const
+                  : message.stopReason === "length" ? "truncated_by_provider" as const : "complete" as const,
+                usage: cut !== null ? emptyUsage() : { input: message.usage?.input ?? null,
+                  output: message.usage?.output ?? null,
+                  reasoning: message.usage?.reasoning ?? message.usage?.reasoningTokens ?? null,
+                  cache: message.usage?.cacheRead ?? null },
+                attempts,
+              };
+            }
+            const message = await stream.result();
+            signal.throwIfAborted();
+            if (message.stopReason === "error" || message.stopReason === "aborted") {
+              options.onFailure?.({ model: `${auth.model.provider}/${auth.model.id}`, api: auth.model.api,
+                status: responseStatus, error: String(message.errorMessage ?? message.stopReason)
+                  .replace(/Bearer\s+\S+|sk-[A-Za-z0-9_-]+/g, "[redacted]") });
+              throw new Error(policyRefused ? "reasoning_policy_unsupported" : "provider_failure");
+            }
+            return {
+              text: (message.content ?? []).filter((part: Json) => part.type === "text").map((part: Json) => part.text).join("\n"),
+              toolCalls: (message.content ?? []).some((part: Json) => part.type === "toolCall"),
+              completion: message.stopReason === "length" ? "truncated_by_provider" as const : "complete" as const,
+              usage: { input: message.usage?.input ?? null, output: message.usage?.output ?? null,
+                reasoning: message.usage?.reasoning ?? message.usage?.reasoningTokens ?? null,
+                cache: message.usage?.cacheRead ?? null },
+              attempts,
+            };
+          } finally {
+            if (stop) signal.removeEventListener("abort", forward);
           }
-          return {
-            text: (message.content ?? []).filter((part: Json) => part.type === "text").map((part: Json) => part.text).join("\n"),
-            toolCalls: (message.content ?? []).some((part: Json) => part.type === "toolCall"),
-            completion: message.stopReason === "length" ? "truncated_by_provider" as const : "complete" as const,
-            usage: { input: message.usage?.input ?? null, output: message.usage?.output ?? null,
-              reasoning: message.usage?.reasoning ?? message.usage?.reasoningTokens ?? null,
-              cache: message.usage?.cacheRead ?? null },
-            attempts,
-          };
         },
       } };
     },

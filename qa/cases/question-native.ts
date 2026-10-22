@@ -458,52 +458,118 @@ async function nativeCase(name: QuestionCase, sandbox: string, artifact: string)
       report.races = { cases, model_change: changed, timeout: timed, completion: completedResult,
         settled_before_delivery_provider_calls: 0, no_retry_fallback_or_main_cancel: true, invalid_deep_timeout: deepInvalid };
     } else if (name === "question-model-inventory") {
-      report.model_inventory = inspectQuestionModels(registry);
-      report.real_provider_requests = 0;
-      const renderNativeDeep = async (model: Json) => {
-        await root.setModel(registry.find(model.provider, model.id)); root.setSessionThinkingLevel("high");
-        const captured = ok<any>(state.capture.forRuntime(root));
-        const bound = ok<any>(state.questions.get(root.sessionManager).bindContext(rootCtx));
-        let proof: Json | undefined;
-        const dry = nativeQuestionTarget({ capture: captured, binding: bound,
-          validate: () => {
-            const fresh = state.questions.get(root.sessionManager).bindContext(rootCtx);
-            return fresh.ok && fresh.value.runtime_instance_id === bound.runtime_instance_id
-              ? { ok: true, value: undefined } : { ok: false, reason: "stale_generation" };
-          },
-          subscribe: (listener) => state.capture.onRuntime((capture: any, event: string) => {
-            if (capture === captured) listener(event === "closed" ? "target_not_live" : undefined);
-          }),
-          onPayload(_snapshot, payload) {
-            proof = { model, keys: Object.keys(payload), reasoning: payload.reasoning,
-              reasoning_effort: payload.reasoning_effort,
-              max_output_tokens: payload.max_output_tokens ?? payload.max_completion_tokens ?? payload.max_tokens ?? null,
-              output_token_field_absent:
-                !("max_tokens" in payload) && !("max_output_tokens" in payload) && !("max_completion_tokens" in payload),
-              stopped_in_onPayload_before_native_transport: true, physical_provider_requests: 0 };
-            throw new Error("QA_NATIVE_BUILDER_STOP_BEFORE_TRANSPORT");
-          },
-        });
-        const prepared = ok<any>(await dry.prepare(ok<any>(dry.read()),
-          "Native request-body construction only. This request must not be sent.", [], "deep", new AbortController().signal));
-        await assert.rejects(prepared.run(), /provider_failure/);
-        assert(proof?.stopped_in_onPayload_before_native_transport);
-        return proof;
-      };
-      const codex = report.model_inventory.find((model: Json) =>
-        model.auth_configured && model.deep_supported && model.api === "openai-codex-responses");
-      if (codex) {
-        report.selected_codex_builder_model = codex;
-        await root.setModel(registry.find(codex.provider, codex.id)); root.setSessionThinkingLevel("high");
-        const refusal = ok<any>(await toolAsk(rootRef, "native-codex-cap-refusal", "Return a short policy-check nonce."));
-        assert.equal(refusal.state, "failed"); assert.equal(refusal.terminal_reason, "reasoning_policy_unsupported");
-        assert.equal(refusal.logical_provider_requests, 0); assert.equal(refusal.physical_provider_attempts, 0);
-        report.native_codex_zero_call_refusal = refusal;
-        report.native_codex_deep_builder = await renderNativeDeep(codex);
-      }
-      const preferredDeep = report.model_inventory.find((model: Json) => model.auth_configured && model.deep_supported);
-      if (preferredDeep && preferredDeep.id !== codex?.id) {
-        report.native_preferred_deep_builder = await renderNativeDeep(preferredDeep);
+      // Real credentials are loaded only to build request bodies. Deny every
+      // non-loopback fetch before it can reach a provider; the counter below is
+      // the receipt, so a literal zero cannot masquerade as a measured zero.
+      const nativeFetch = globalThis.fetch;
+      const loopbackHosts = new Set(["127.0.0.1", "localhost", "::1"]);
+      let deniedRequests = 0;
+      globalThis.fetch = (async (input: any, init?: any) => {
+        const raw = typeof input === "string" ? input : input instanceof URL ? input.href : input?.url;
+        let host = "";
+        try {
+          // WHATWG URL keeps the brackets on IPv6 hostnames: [::1].
+          host = new URL(String(raw)).hostname.toLowerCase().replace(/^\[(.*)\]$/, "$1");
+        } catch { host = ""; }
+        if (loopbackHosts.has(host)) return nativeFetch(input, init);
+        deniedRequests++;
+        throw new Error("QA_NETWORK_DENIED");
+      }) as typeof fetch;
+      try {
+        report.model_inventory = inspectQuestionModels(registry);
+        const renderNativeDeep = async (model: Json) => {
+          await root.setModel(registry.find(model.provider, model.id)); root.setSessionThinkingLevel("high");
+          const captured = ok<any>(state.capture.forRuntime(root));
+          const bound = ok<any>(state.questions.get(root.sessionManager).bindContext(rootCtx));
+          let proof: Json | undefined;
+          const dry = nativeQuestionTarget({ capture: captured, binding: bound,
+            validate: () => {
+              const fresh = state.questions.get(root.sessionManager).bindContext(rootCtx);
+              return fresh.ok && fresh.value.runtime_instance_id === bound.runtime_instance_id
+                ? { ok: true, value: undefined } : { ok: false, reason: "stale_generation" };
+            },
+            subscribe: (listener) => state.capture.onRuntime((capture: any, event: string) => {
+              if (capture === captured) listener(event === "closed" ? "target_not_live" : undefined);
+            }),
+            onPayload(_snapshot, payload) {
+              proof = { model, keys: Object.keys(payload), reasoning: payload.reasoning,
+                reasoning_effort: payload.reasoning_effort,
+                max_output_tokens: payload.max_output_tokens ?? payload.max_completion_tokens ?? payload.max_tokens ?? null,
+                output_token_field_absent:
+                  !("max_tokens" in payload) && !("max_output_tokens" in payload) && !("max_completion_tokens" in payload),
+                stopped_in_onPayload_before_native_transport: true, physical_provider_requests: 0 };
+              throw new Error("QA_NATIVE_BUILDER_STOP_BEFORE_TRANSPORT");
+            },
+          });
+          const prepared = ok<any>(await dry.prepare(ok<any>(dry.read()),
+            "Native request-body construction only. This request must not be sent.", [], "deep", new AbortController().signal));
+          await assert.rejects(prepared.run(), /provider_failure/);
+          assert(proof?.stopped_in_onPayload_before_native_transport);
+          return proof;
+        };
+        const renderNativeQuick = async (model: Json) => {
+          await root.setModel(registry.find(model.provider, model.id)); root.setSessionThinkingLevel("high");
+          const captured = ok<any>(state.capture.forRuntime(root));
+          const bound = ok<any>(state.questions.get(root.sessionManager).bindContext(rootCtx));
+          let proof: Json | undefined;
+          const dry = nativeQuestionTarget({ capture: captured, binding: bound,
+            validate: () => {
+              const fresh = state.questions.get(root.sessionManager).bindContext(rootCtx);
+              return fresh.ok && fresh.value.runtime_instance_id === bound.runtime_instance_id
+                ? { ok: true, value: undefined } : { ok: false, reason: "stale_generation" };
+            },
+            subscribe: (listener) => state.capture.onRuntime((capture: any, event: string) => {
+              if (capture === captured) listener(event === "closed" ? "target_not_live" : undefined);
+            }),
+            onPayload(_snapshot, payload) {
+              proof = { model, keys: Object.keys(payload), reasoning: payload.reasoning,
+                reasoning_effort: payload.reasoning_effort ?? null,
+                tools_absent: !("tools" in payload), tool_choice_absent: !("tool_choice" in payload),
+                service_tier_absent: !("service_tier" in payload),
+                output_token_field_absent: !("max_tokens" in payload) && !("max_output_tokens" in payload) &&
+                  !("max_completion_tokens" in payload),
+                stopped_in_onPayload_before_native_transport: true, physical_provider_requests: 0 };
+              throw new Error("QA_NATIVE_BUILDER_STOP_BEFORE_TRANSPORT");
+            },
+          });
+          const prepared = ok<any>(await dry.prepare(ok<any>(dry.read()),
+            "Native request-body construction only. This request must not be sent.", [], "quick", new AbortController().signal));
+          await assert.rejects(prepared.run(), /provider_failure/);
+          assert(proof?.stopped_in_onPayload_before_native_transport, "QUICK_BUILDER_TRANSPORT_NOT_STOPPED");
+          assert.equal(proof!.reasoning?.effort, "low", JSON.stringify(proof));
+          assert.equal(proof!.tools_absent, true, JSON.stringify(proof));
+          assert.equal(proof!.tool_choice_absent, true, JSON.stringify(proof));
+          assert.equal(proof!.service_tier_absent, true, JSON.stringify(proof));
+          assert.equal(proof!.output_token_field_absent, true, JSON.stringify(proof));
+          const controls = prepared.controls;
+          assert.equal(controls.wire_output_budget, null, JSON.stringify(controls));
+          assert.equal(controls.output_cap, "client_abort", JSON.stringify(controls));
+          return { proof, controls: { wire_output_budget: controls.wire_output_budget,
+            output_cap: controls.output_cap, output_cap_scope: controls.output_cap_scope,
+            client_output_limit_utf8_bytes: controls.client_output_limit_utf8_bytes,
+            wire_reasoning_effort: controls.wire_reasoning_effort,
+            requested_service_tier: controls.requested_service_tier, wire_service_tier: controls.wire_service_tier,
+            physical_attempts_basis: controls.physical_attempts_basis,
+            physical_attempts_wire_verified: controls.physical_attempts_wire_verified } };
+        };
+        const codex = report.model_inventory.find((model: Json) =>
+          model.auth_configured && model.deep_supported && model.api === "openai-codex-responses");
+        if (codex) {
+          report.selected_codex_builder_model = codex;
+          await root.setModel(registry.find(codex.provider, codex.id)); root.setSessionThinkingLevel("high");
+          report.native_codex_deep_builder = await renderNativeDeep(codex);
+          report.native_codex_quick_builder = await renderNativeQuick(codex);
+        }
+        const preferredDeep = report.model_inventory.find((model: Json) => model.auth_configured && model.deep_supported);
+        if (preferredDeep && preferredDeep.id !== codex?.id) {
+          report.native_preferred_deep_builder = await renderNativeDeep(preferredDeep);
+        }
+        report.real_provider_requests = deniedRequests;
+        assert.equal(report.real_provider_requests, 0, "QA_INVENTORY_NETWORK_REQUEST");
+      } finally {
+        globalThis.fetch = nativeFetch;
+        report.real_provider_requests = deniedRequests;
+        report.network_deny = { loopback_hosts: [...loopbackHosts], denied_requests: deniedRequests };
       }
     } else {
       report.real_model = await realQuestion({ name, root, registry, rootRef, childContext: a.ctx, toolAsk });
