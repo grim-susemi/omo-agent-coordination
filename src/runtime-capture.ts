@@ -36,11 +36,24 @@ export interface RuntimeSnapshot {
   readonly messages: readonly unknown[];
   readonly activity: LiveSession["activitySnapshot"];
 }
+/** Live scalar facts plus the message array by reference: no clone and no hash. */
+export interface RuntimeObservation {
+  readonly session_id: string;
+  readonly runtime_instance_id: string;
+  readonly generation: number;
+  readonly branch: string | null;
+  readonly revision: number;
+  readonly observed_at: string;
+  readonly messages: readonly unknown[];
+  readonly activity: LiveSession["activitySnapshot"];
+}
 export interface CapturedRuntime {
   readonly runtime_instance_id: string;
   runtime(): LiveSession | undefined;
   /** Same verdict as `read().ok` without cloning and hashing the conversation. */
   alive(): boolean;
+  /** Same liveness verdict as `read()`, but returns the messages by reference. */
+  observe(): CaptureResult<RuntimeObservation>;
   read(): CaptureResult<RuntimeSnapshot>;
 }
 interface Prototype {
@@ -129,6 +142,18 @@ export function createRuntimeCapture(options: {
         if (disposed || refusal) return false;
         const actual = ref.deref();
         return !closed && !!actual && !actual._disposed && !!actual.model;
+      },
+      observe(): CaptureResult<RuntimeObservation> {
+        if (disposed) return { ok: false, reason: "stale_generation" };
+        if (refusal) return { ok: false, reason: "unsupported_runtime", connection: refusal };
+        const actual = ref.deref();
+        if (closed || !actual || actual._disposed) return { ok: false, reason: "target_not_live" };
+        if (!actual.model) return { ok: false, reason: "unsupported_runtime", connection: "model_unavailable" };
+        return { ok: true, value: {
+          session_id: actual.sessionId, runtime_instance_id: instance, generation: options.generation,
+          branch: actual.sessionManager.getLeafId(), revision, observed_at: new Date().toISOString(),
+          messages: actual.messages, activity: { ...actual.activitySnapshot },
+        } };
       },
       read(): CaptureResult<RuntimeSnapshot> {
         if (disposed) return { ok: false, reason: "stale_generation" };
