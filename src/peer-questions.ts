@@ -1130,18 +1130,16 @@ export function createOwnedQuestions(options: {
     return observation(actual.value.binding, observed.value);
   });
   const rootBinding = (): Result<TargetBinding> => {
-    const peers = options.truth.peers(), read = options.owner.read();
-    if (!runtime || !peers.ok || !read.ok) return refuse("stale_generation");
-    const root = peers.value.peers.find((peer) => peer.role === "root");
-    if (!root) return refuse("unsupported_runtime");
+    const facts = options.truth.rootFacts();
+    if (!runtime || !facts.ok || !options.owner.alive()) return refuse("stale_generation");
     const carrier = (globalThis as Json)[Symbol.for("omo.agent-coordination.native.v1") as any];
     const engine = carrier?.contexts.get(runtime.sessionManager)?.deref();
     if (!engine) return refuse("unsupported_runtime");
-    return { ok: true, value: { kind: "root", target_ref: root.target_ref,
+    return { ok: true, value: { kind: "root", target_ref: facts.value.target_ref,
       owner_session_id: runtime.sessionId, owner_root_id: engine.ancestry?.rootSessionId ?? runtime.sessionId,
       canonical_session_id: runtime.sessionId, session_id: runtime.sessionId.replace(/^senpi:/, ""),
       runtime_instance_id: options.owner.runtime_instance_id, generation: options.capture.generation,
-      branch: read.value.branch ?? `session:${runtime.sessionId}` } };
+      branch: facts.value.branch ?? `session:${runtime.sessionId}` } };
   };
   const binding = (ref: TargetRef): Result<{ binding: TargetBinding; capture?: CapturedRuntime }> => {
     if (disposed) return refuse("stale_generation");

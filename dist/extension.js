@@ -66,6 +66,27 @@ function createRuntimeCapture(options) {
         const actual = ref.deref();
         return !closed && !!actual && !actual._disposed && !!actual.model;
       },
+      observe() {
+        if (disposed)
+          return { ok: false, reason: "stale_generation" };
+        if (refusal)
+          return { ok: false, reason: "unsupported_runtime", connection: refusal };
+        const actual = ref.deref();
+        if (closed || !actual || actual._disposed)
+          return { ok: false, reason: "target_not_live" };
+        if (!actual.model)
+          return { ok: false, reason: "unsupported_runtime", connection: "model_unavailable" };
+        return { ok: true, value: {
+          session_id: actual.sessionId,
+          runtime_instance_id: instance,
+          generation: options.generation,
+          branch: actual.sessionManager.getLeafId(),
+          revision,
+          observed_at: new Date().toISOString(),
+          messages: actual.messages,
+          activity: { ...actual.activitySnapshot }
+        } };
+      },
       read() {
         if (disposed)
           return { ok: false, reason: "stale_generation" };
@@ -1065,9 +1086,31 @@ function createTaskTruth(options) {
   let readRemote;
   const remoteObservations = new Map;
   const remoteChanges = new Map;
+  const currentRoot = () => {
+    if (disposed || options.capture.generation !== options.generation)
+      return { ok: false, reason: "stale_generation" };
+    const actual = root?.deref();
+    if (!actual || options.owner.runtime() !== actual || actual.sessionId !== session) {
+      return { ok: false, reason: "scope_denied" };
+    }
+    return { ok: true, value: actual };
+  };
+  const syncRootBranch = (actual) => {
+    const leaf = actual.sessionManager.getLeafId();
+    if (rootBranch === null)
+      rootBranch = leaf;
+    else if (leaf !== rootBranch) {
+      const entries = Reflect.apply(Reflect.get(actual.sessionManager, "getBranch"), actual.sessionManager, []);
+      if (!entries.some((entry) => entry.id === rootBranch)) {
+        rootRef = `coordination:${randomUUID3()}`;
+        rootBranch = leaf;
+      }
+    }
+    return leaf;
+  };
   const rootInspection = () => {
-    const read = options.owner.read();
-    const runtime = read.ok ? read.value : null;
+    const observed = options.owner.observe();
+    const runtime = observed.ok ? observed.value : null;
     const at = runtime?.observed_at ?? new Date().toISOString();
     const unknown = () => fact("unknown", "root has no native task record", at);
     return {
@@ -1126,9 +1169,9 @@ function createTaskTruth(options) {
         continue;
       if (!options.capture.bindOwned(options.bridge, ref, capture).ok)
         continue;
-      const read = capture.read();
-      if (read.ok)
-        runtime = read.value;
+      const observed = capture.observe();
+      if (observed.ok)
+        runtime = observed.value;
       break;
     }
     const fresh = options.bridge.inspectOwned(ref);
@@ -1143,22 +1186,10 @@ function createTaskTruth(options) {
     return projectTask(fresh.value, runtime, runtime ? true : fresh.value.residency === "rpc_detached" ? false : "unknown", options.asks?.(ref));
   };
   const refresh = () => {
-    if (disposed || options.capture.generation !== options.generation)
-      return { ok: false, reason: "stale_generation" };
-    const actual = root?.deref();
-    if (!actual || options.owner.runtime() !== actual || actual.sessionId !== session) {
-      return { ok: false, reason: "scope_denied" };
-    }
-    const leaf = actual.sessionManager.getLeafId();
-    if (rootBranch === null)
-      rootBranch = leaf;
-    else if (leaf !== rootBranch) {
-      const entries = Reflect.apply(Reflect.get(actual.sessionManager, "getBranch"), actual.sessionManager, []);
-      if (!entries.some((entry) => entry.id === rootBranch)) {
-        rootRef = `coordination:${randomUUID3()}`;
-        rootBranch = leaf;
-      }
-    }
+    const rootNow = currentRoot();
+    if (!rootNow.ok)
+      return rootNow;
+    syncRootBranch(rootNow.value);
     const listed = options.bridge.listOwned();
     if (!listed.ok)
       return listed;
@@ -1278,6 +1309,12 @@ function createTaskTruth(options) {
         return { ok: true, value: rootInspection() };
       const snapshot = options.bridge.inspectOwned(target);
       return snapshot.ok ? { ok: true, value: project(snapshot.value) } : snapshot;
+    },
+    rootFacts() {
+      const current = currentRoot();
+      if (!current.ok)
+        return current;
+      return { ok: true, value: { target_ref: rootRef, branch: syncRootBranch(current.value) } };
     },
     peers() {
       const tree = refresh();
@@ -3537,26 +3574,23 @@ function createOwnedQuestions(options) {
     return observation(actual.value.binding, observed.value);
   });
   const rootBinding = () => {
-    const peers = options.truth.peers(), read = options.owner.read();
-    if (!runtime || !peers.ok || !read.ok)
+    const facts = options.truth.rootFacts();
+    if (!runtime || !facts.ok || !options.owner.alive())
       return refuse2("stale_generation");
-    const root = peers.value.peers.find((peer) => peer.role === "root");
-    if (!root)
-      return refuse2("unsupported_runtime");
     const carrier2 = globalThis[Symbol.for("omo.agent-coordination.native.v1")];
     const engine = carrier2?.contexts.get(runtime.sessionManager)?.deref();
     if (!engine)
       return refuse2("unsupported_runtime");
     return { ok: true, value: {
       kind: "root",
-      target_ref: root.target_ref,
+      target_ref: facts.value.target_ref,
       owner_session_id: runtime.sessionId,
       owner_root_id: engine.ancestry?.rootSessionId ?? runtime.sessionId,
       canonical_session_id: runtime.sessionId,
       session_id: runtime.sessionId.replace(/^senpi:/, ""),
       runtime_instance_id: options.owner.runtime_instance_id,
       generation: options.capture.generation,
-      branch: read.value.branch ?? `session:${runtime.sessionId}`
+      branch: facts.value.branch ?? `session:${runtime.sessionId}`
     } };
   };
   const binding = (ref) => {

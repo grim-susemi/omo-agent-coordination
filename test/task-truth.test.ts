@@ -138,7 +138,8 @@ test("redacted process observations reject stale identity, epoch, generation, ev
   const snapshot = record();
   const rootRuntime = { sessionId: "owner", sessionManager: { getLeafId: () => "root-branch" } };
   const rootRead = { ...runtime(), session_id: "owner", branch: "root-branch" };
-  const owner = { runtime: () => rootRuntime, read: () => ({ ok: true, value: rootRead }) } as unknown as CapturedRuntime;
+  const owner = { runtime: () => rootRuntime, observe: () => ({ ok: true, value: rootRead }),
+    read: () => ({ ok: true, value: rootRead }) } as unknown as CapturedRuntime;
   const bridge = { listOwned: () => ({ ok: true, value: [snapshot] }),
     inspectOwned: () => ({ ok: true, value: snapshot }),
     subscribeOutcome: () => ({ ok: true, value: () => {} }) } as unknown as EngineBridge;

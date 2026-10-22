@@ -3,7 +3,7 @@ import type { Asks, DenialReason, Fact, Peer, Roster, TargetBinding, TargetInspe
   TreeInspection } from "./contracts.ts";
 import type { BridgeResult, EngineBridge, EnumerationIssue, OwnedIdentity,
   OwnedSnapshot } from "./engine-bridge.ts";
-import type { CapturedRuntime, RuntimeCapture, RuntimeSnapshot } from "./runtime-capture.ts";
+import type { CapturedRuntime, LiveSession, RuntimeCapture, RuntimeObservation, RuntimeSnapshot } from "./runtime-capture.ts";
 
 type Policy = { readonly allowed: boolean; readonly denial_reason?: DenialReason };
 export function peerPolicy(role: string, native: Policy, asks: Asks = "allowed"):
@@ -19,7 +19,7 @@ const terminal = (status: string) => ["completed", "error", "cancelled", "interr
 function fact<T>(value: T | "unknown", source: string, at: string, evidence_ref?: string): Fact<T> {
   return { value, source, observed_at: at, ...(evidence_ref ? { evidence_ref } : {}) };
 }
-function activityOf(runtime: RuntimeSnapshot): string {
+function activityOf(runtime: RuntimeSnapshot | RuntimeObservation): string {
   const activity = runtime.activity;
   if (activity.isBashRunning) return "bash";
   if (activity.isCompacting) return "compaction";
@@ -59,7 +59,7 @@ export interface RemoteRuntimeObservation {
 }
 
 /** Input facts are current owner snapshots, not model text or a persisted transcript. */
-export function projectTask(snapshot: OwnedSnapshot, runtime: RuntimeSnapshot | RuntimeFacts | null,
+export function projectTask(snapshot: OwnedSnapshot, runtime: RuntimeSnapshot | RuntimeObservation | RuntimeFacts | null,
   reachable: boolean | "unknown" = runtime ? true : "unknown", asks: Asks = "allowed"): TargetInspection {
   const at = snapshot.observed_at;
   const id = snapshot.identity;
@@ -129,9 +129,29 @@ export function createTaskTruth(options: {
   let readRemote: ((ref: TargetRef) => Promise<RemoteRuntimeObservation | null>) | undefined;
   const remoteObservations = new Map<TargetRef, RemoteRuntimeObservation>();
   const remoteChanges = new Map<TargetRef, { change: number; revision: number }>();
+  const currentRoot = (): BridgeResult<LiveSession> => {
+    if (disposed || options.capture.generation !== options.generation) return { ok: false, reason: "stale_generation" };
+    const actual = root?.deref();
+    if (!actual || options.owner.runtime() !== actual || actual.sessionId !== session) {
+      return { ok: false, reason: "scope_denied" };
+    }
+    return { ok: true, value: actual };
+  };
+  const syncRootBranch = (actual: LiveSession): string | null => {
+    const leaf = actual.sessionManager.getLeafId();
+    if (rootBranch === null) rootBranch = leaf;
+    else if (leaf !== rootBranch) {
+      const entries = Reflect.apply(Reflect.get(actual.sessionManager, "getBranch"), actual.sessionManager, []) as { id: string }[];
+      if (!entries.some((entry) => entry.id === rootBranch)) {
+        rootRef = `coordination:${randomUUID()}` as TargetRef;
+        rootBranch = leaf;
+      }
+    }
+    return leaf;
+  };
   const rootInspection = (): TargetInspection => {
-    const read = options.owner.read();
-    const runtime = read.ok ? read.value : null;
+    const observed = options.owner.observe();
+    const runtime = observed.ok ? observed.value : null;
     const at = runtime?.observed_at ?? new Date().toISOString();
     const unknown = <T>() => fact<T>("unknown", "root has no native task record", at);
     return {
@@ -161,14 +181,14 @@ export function createTaskTruth(options: {
       const subscribed = options.bridge.subscribeOutcome(ref, () => {});
       if (subscribed.ok) subscriptions.set(ref, subscribed.value);
     }
-    let runtime: RuntimeSnapshot | RuntimeFacts | null = null;
+    let runtime: RuntimeSnapshot | RuntimeObservation | RuntimeFacts | null = null;
     for (const capture of options.capture.list()) {
       if (capture.runtime()?.sessionId.replace(/^senpi:/, "") !== snapshot.identity.session_id) continue;
       // Matching strings are discovery only. This call still requires the exact
       // runtime object recorded by the original native runner and managed handle.
       if (!options.capture.bindOwned(options.bridge, ref, capture).ok) continue;
-      const read = capture.read();
-      if (read.ok) runtime = read.value;
+      const observed = capture.observe();
+      if (observed.ok) runtime = observed.value;
       break;
     }
     const fresh = options.bridge.inspectOwned(ref);
@@ -190,20 +210,9 @@ export function createTaskTruth(options: {
       fresh.value.residency === "rpc_detached" ? false : "unknown", options.asks?.(ref));
   };
   const refresh = (): BridgeResult<InspectionTree> => {
-    if (disposed || options.capture.generation !== options.generation) return { ok: false, reason: "stale_generation" };
-    const actual = root?.deref();
-    if (!actual || options.owner.runtime() !== actual || actual.sessionId !== session) {
-      return { ok: false, reason: "scope_denied" };
-    }
-    const leaf = actual.sessionManager.getLeafId();
-    if (rootBranch === null) rootBranch = leaf;
-    else if (leaf !== rootBranch) {
-      const entries = Reflect.apply(Reflect.get(actual.sessionManager, "getBranch"), actual.sessionManager, []) as { id: string }[];
-      if (!entries.some((entry) => entry.id === rootBranch)) {
-        rootRef = `coordination:${randomUUID()}` as TargetRef;
-        rootBranch = leaf;
-      }
-    }
+    const rootNow = currentRoot();
+    if (!rootNow.ok) return rootNow;
+    syncRootBranch(rootNow.value);
     const listed = options.bridge.listOwned();
     if (!listed.ok) return listed;
     const targets: TargetInspection[] = [rootInspection()];
@@ -286,6 +295,11 @@ export function createTaskTruth(options: {
       if (target === rootRef) return { ok: true, value: rootInspection() };
       const snapshot = options.bridge.inspectOwned(target);
       return snapshot.ok ? { ok: true, value: project(snapshot.value) } : snapshot;
+    },
+    rootFacts(): BridgeResult<{ target_ref: TargetRef; branch: string | null }> {
+      const current = currentRoot();
+      if (!current.ok) return current;
+      return { ok: true, value: { target_ref: rootRef, branch: syncRootBranch(current.value) } };
     },
     peers(): BridgeResult<Roster> {
       const tree = refresh();
